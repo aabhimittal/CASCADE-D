@@ -31,12 +31,5 @@ class D1Backend(DecisionBackend):
 def _to_probs(q: Question, raw: dict) -> dict[str, float]:
     if q.type == "noul":
         return {"true": float(raw["noul"]), "false": 1.0 - float(raw["noul"])}
-    probs = raw["probabilities"]
-    if q.type == "choice":
-        return {k: float(probs[k]) for k in q.options}
-    # shortcut: model card doesn't pin the shape of score probabilities; we read them positionally,
-    # lowest level first (list, or dict in insertion order). Recheck against real d1 output before M1.
-    values = list(probs.values()) if isinstance(probs, dict) else list(probs)
-    if len(values) != len(q.options):
-        raise ValueError(f"score has {len(q.options)} levels but d1 returned {len(values)} probabilities")
-    return dict(zip(q.options, map(float, values)))
+    # choice and score both return {option: p}; score keys are "0".."n-1", lowest level first
+    return {k: float(raw["probabilities"][k]) for k in q.options}
