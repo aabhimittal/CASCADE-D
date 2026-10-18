@@ -1,0 +1,12 @@
+[project]
+name = "cascaded"
+version = "0.0.1"
+requires-python = ">=3.10"
+dependencies = ["pydantic>=2", "numpy"]
+
+[project.optional-dependencies]
+d1 = ["transformers>=5.14", "torch", "torchvision", "pillow"]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["cascaded", "cascaded.backends"]
