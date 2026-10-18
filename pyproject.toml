@@ -6,7 +6,8 @@ dependencies = ["pydantic>=2", "numpy"]
 
 [project.optional-dependencies]
 d1 = ["transformers>=5.14", "torch", "torchvision", "pillow"]
-dev = ["pytest"]
+proxy = ["fastapi", "uvicorn"]
+dev = ["pytest", "fastapi", "httpx"]
 
 [tool.setuptools]
 packages = ["cascaded", "cascaded.backends"]
