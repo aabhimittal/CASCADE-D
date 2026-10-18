@@ -7,6 +7,7 @@ dependencies = ["pydantic>=2", "numpy"]
 [project.optional-dependencies]
 d1 = ["transformers>=5.14", "torch", "torchvision", "pillow"]
 proxy = ["fastapi", "uvicorn"]
+bench = ["datasets"]
 dev = ["pytest", "fastapi", "httpx"]
 
 [tool.setuptools]

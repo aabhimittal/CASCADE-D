@@ -13,7 +13,7 @@ than the best of them on validation.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import product
 from statistics import NormalDist
 
@@ -42,10 +42,14 @@ class Result:
     cost: float                    # mean cost per request
     error: float                   # end-to-end error rate
     coverage: tuple[float, ...]    # share of requests each tier answered
+    per_request: np.ndarray = field(default=None, repr=False)  # each request's summed cost
 
 
 def simulate(conf: np.ndarray, correct: np.ndarray, costs, thresholds) -> Result:
-    """Replay a cascade over (tiers, n) arrays of confidence and correctness."""
+    """Replay a cascade over (tiers, n) arrays of confidence and correctness.
+
+    costs[k] is a scalar or a per-request array; pass measured latencies to get per-request latency.
+    """
     n = conf.shape[1]
     taus = (*thresholds, 0.0)  # the last tier accepts everything that reaches it
     answered_by = np.full(n, -1)
@@ -54,11 +58,11 @@ def simulate(conf: np.ndarray, correct: np.ndarray, costs, thresholds) -> Result
         if tau == SKIP:
             continue
         pending = answered_by < 0
-        cost[pending] += costs[k]
+        cost[pending] += np.broadcast_to(costs[k], n)[pending]
         answered_by[pending & (conf[k] >= tau)] = k
     wrong = ~correct[answered_by, np.arange(n)]
     coverage = tuple(float(np.mean(answered_by == k)) for k in range(len(taus)))
-    return Result(tuple(thresholds), float(cost.mean()), float(wrong.mean()), coverage)
+    return Result(tuple(thresholds), float(cost.mean()), float(wrong.mean()), coverage, cost)
 
 
 def error_upper_bound(error: float, n: int, delta: float) -> float:

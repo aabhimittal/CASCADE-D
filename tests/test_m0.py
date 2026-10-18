@@ -74,11 +74,11 @@ class FakeD1:
         assert questions["team"]["criteria"]["billing"]  # schema passed through unchanged
         return {
             "answers": {
-                "refund": {"noul": 0.93},
+                "refund": {"type": "noul", "noul": 0.93},
                 "team": {"choice": "billing", "confidence": 0.81,
                          "probabilities": {"billing": 0.81, "technical": 0.04, "fraud": 0.15}},
-                "urgency": {"score": 1.1, "confidence": 0.6, "probabilities": [0.2, 0.6, 0.2],
-                            "legend": ["Can wait", "Today", "Blocking now"]},
+                "urgency": {"score": 1.1, "confidence": 0.6, "probabilities": {"0": 0.2, "1": 0.6, "2": 0.2},
+                            "legend": {"0": "Can wait", "1": "Today", "2": "Blocking now"}},
             },
             "usage": {"input_tokens": 42, "output_tokens": 0},
         }
