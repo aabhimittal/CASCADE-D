@@ -4,31 +4,10 @@ import numpy as np
 import pytest
 
 from cascaded.backends.base import DecisionBackend
-from cascaded.benchmark import collect, load, main, render, run
+from cascaded.benchmark import collect, load, main, render, run, synthetic_rows
 from cascaded.schema import Answer, DecisionRequest, DecisionResponse
 
-NAMES, COSTS = ["d1", "small", "large"], [0.0001, 0.001, 0.01]
-
-
-def synthetic_rows(n=3000, seed=0):
-    """Cache rows for 3 tiers on one yes/no question; the small LLM is overconfident (T≈2)."""
-    rng = np.random.default_rng(seed)
-    d = rng.uniform(-3, 3, n)
-    rows = []
-    for i in range(n):
-        truth = "true" if rng.uniform() < 0.5 else "false"
-        row = {"truth": {"q": truth}, "tiers": {}}
-        for name, skill, sharpen, ms in zip(NAMES, (1.0, 2.0, 5.0), (1.0, 2.0, 1.0), (10, 200, 900)):
-            p_right = 1 / (1 + np.exp(-(skill - d[i] + rng.normal(0, 0.5))))
-            right = rng.uniform() < p_right
-            p_label = 1 / (1 + np.exp(-sharpen * np.log(p_right / (1 - p_right))))  # reported confidence
-            other = "false" if truth == "true" else "true"
-            said, alt = (truth, other) if right else (other, truth)
-            row["tiers"][name] = {"answers": {"q": {said: float(max(p_label, 1 - p_label)),
-                                                    alt: float(min(p_label, 1 - p_label))}},
-                                  "ms": float(ms * rng.uniform(0.8, 1.2))}
-        rows.append(row)
-    return rows
+from cascaded.benchmark import SYNTHETIC_COSTS as COSTS, SYNTHETIC_TIERS as NAMES
 
 
 class Fake(DecisionBackend):
@@ -104,11 +83,26 @@ def test_cli_writes_report(tmp_path):
     assert out.read_text().startswith("<!doctype html>")
 
 
-def test_tier_summary_coverage_at_risk():
+def test_tier_summary_held_out():
     from cascaded.benchmark import tier_summary
-    rows = [{"truth": {"q": "true"}, "tiers": {"t": {"answers": {"q": {"true": c, "false": 1 - c}}, "ms": 1.0}}}
-            for c in (0.99, 0.95, 0.9, 0.85)]
-    rows.append({"truth": {"q": "false"}, "tiers": {"t": {"answers": {"q": {"true": 0.6, "false": 0.4}}, "ms": 1.0}}})
-    s = tier_summary(rows, "t", risks=(0.0, 0.2))
-    assert s["accuracy"] == 0.8
-    assert s["coverage_at_risk"] == {0.0: 0.8, 0.2: 1.0}  # the one miss is the least confident
+    s = tier_summary(synthetic_rows(1000, seed=6), "large", epsilons=(0.05,), splits=3)
+    h = s["held_out"][0.05]
+    assert h["feasible"] == 3 and h["worst_error"] <= 0.05
+    assert h["coverage"]["mean"] > 0.8 and 0.9 < s["accuracy"] < 1.0
+
+
+def test_learned_router_baseline_uses_request_text():
+    rows = synthetic_rows(2000, seed=5)
+    for r in rows:  # make the small LLM's correctness predictable from the text
+        ok = next(iter(r["tiers"]["small"]["answers"]["q"].items()))[0] == r["truth"]["q"]
+        r["state"] = "easy routine request" if ok else "tricky unusual request"
+    res = run(rows, NAMES, COSTS, epsilons=(0.1,), splits=2)
+    p = res["summary"]["router"][0.1]
+    assert p["met_eps"] == 2 and p["error"]["mean"] <= 0.1
+    small_share = p["coverage"][1]
+    assert small_share > 0.5  # the router learned to send "easy" text to the cheap model
+    assert "Learned router" in render(res, "t")
+
+
+def test_router_skipped_without_request_text(result):
+    assert result["summary"]["router"] == {}

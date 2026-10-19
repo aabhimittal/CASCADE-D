@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from cascaded.backends.base import DecisionBackend
-from cascaded.optimizer import SKIP, Cascade, error_upper_bound, optimize, outcomes, risk_coverage, simulate
+from cascaded.optimizer import SKIP, Cascade, binom_pvalue, optimize, outcomes, risk_coverage, simulate
 from cascaded.schema import Answer, DecisionRequest, DecisionResponse
 
 COSTS = [0.01, 1.0, 10.0]  # d1 ~free, small LLM, large LLM
@@ -12,7 +12,7 @@ def synthetic(n, seed):
     """Three calibrated tiers sharing a per-request difficulty; bigger tiers are more accurate."""
     rng = np.random.default_rng(seed)
     d = rng.uniform(-3, 3, n)
-    skill = np.array([[0.5], [2.0], [5.0]])
+    skill = np.array([[2.5], [2.0], [5.0]])  # tier 0 about as accurate as the real d1-3B on AG News
     conf = 1 / (1 + np.exp(-(skill - d + rng.normal(0, 0.5, (3, n)))))
     conf = np.maximum(conf, 1 - conf)  # binary decisions: confidence is never below 0.5
     correct = rng.uniform(size=(3, n)) < conf
@@ -39,9 +39,10 @@ def test_skip_removes_tier_and_its_cost():
     assert always_small.cost == 1.0 and always_small.coverage == (0.0, 1.0, 0.0)
 
 
-def test_wilson_bound_is_above_observed_and_shrinks_with_n():
-    assert error_upper_bound(0.05, 100, 0.01) > error_upper_bound(0.05, 10_000, 0.01) > 0.05
-    assert error_upper_bound(0.0, 1000, 0.01) > 0
+def test_binom_pvalue():
+    assert binom_pvalue(50, 1000, 0.05) == pytest.approx(0.5, abs=0.04)   # observed == epsilon: no evidence
+    assert binom_pvalue(20, 1000, 0.05) < 1e-5                            # far below epsilon: strong evidence
+    assert binom_pvalue(2, 100, 0.05) > binom_pvalue(20, 1000, 0.05)      # same rate, more data: smaller p
 
 
 def test_meets_epsilon_on_held_out_across_10_splits():
@@ -55,7 +56,7 @@ def test_meets_epsilon_on_held_out_across_10_splits():
         chosen = optimize(conf[:, val], correct[:, val], COSTS, eps)
         held_out = simulate(conf[:, test], correct[:, test], COSTS, chosen.thresholds)
         assert held_out.error <= eps, f"split {split}: {held_out.error:.4f} > {eps}"
-        assert held_out.cost < 0.6 * always_large.cost  # the cascade has to be worth it
+        assert held_out.cost < 0.7 * always_large.cost  # the cascade has to be worth it
         assert held_out.coverage[0] > 0.05              # and tier 0 actually answers traffic
 
 

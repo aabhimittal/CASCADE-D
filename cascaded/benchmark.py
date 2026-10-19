@@ -10,7 +10,9 @@ Compared on held-out data:
   CASCADE-D           all tiers, thresholds from optimizer.optimize at each target ε
   LLM-only cascade    same optimizer without tier 0: isolates what the decision model adds
   always-<tier>       each tier alone
-A learned RouteLLM-style router is not implemented (it needs a trained router per dataset).
+  learned router      RouteLLM-style: a text classifier predicts whether the small LLM will be
+                      right and routes small-vs-large *before* calling either (hashed n-grams +
+                      logistic regression; weaker features than RouteLLM's, so a lower bound)
 
     python -m cascaded.benchmark CACHE.jsonl --tiers d1-3B,small,large --costs 0.0001,0.001,0.01 --out report.html
 """
@@ -18,13 +20,15 @@ A learned RouteLLM-style router is not implemented (it needs a trained router pe
 import argparse
 import html
 import json
+import re
 import time
+import zlib
 
 import numpy as np
 
 from cascaded.backends.base import DecisionBackend
 from cascaded.calibration import Example, fit_temperature, reliability, scale
-from cascaded.optimizer import SKIP, optimize, risk_coverage, simulate
+from cascaded.optimizer import SKIP, binom_pvalue, optimize, risk_coverage, simulate
 from cascaded.schema import Answer
 
 EPSILONS = (0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2)
@@ -40,7 +44,7 @@ def collect(tiers: list[DecisionBackend], examples: list[Example], path: str) ->
     """
     with open(path, "a") as f:
         for request, truth in examples:
-            row = {"truth": truth, "tiers": {}}
+            row = {"state": request.state, "truth": truth, "tiers": {}}  # state: input for learned routers
             for t in tiers:
                 start = time.perf_counter()
                 try:
@@ -109,8 +113,62 @@ def _point(conf, correct, ms, costs, taus) -> dict:
             "p50_ms": float(np.percentile(lat, 50)), "p99_ms": float(np.percentile(lat, 99))}
 
 
+def _features(texts, dim=4096) -> np.ndarray:
+    """Hashed unigram+bigram presence; crc32 so features are stable across processes."""
+    X = np.zeros((len(texts), dim), dtype=np.float32)
+    for i, t in enumerate(texts):
+        words = re.findall(r"\w+", str(t).lower())
+        for g in words + [a + " " + b for a, b in zip(words, words[1:])]:
+            X[i, zlib.crc32(g.encode()) % dim] = 1.0
+    return X
+
+
+def _logreg(X, y, l2=1e-2, steps=300, lr=0.5):
+    w, b = np.zeros(X.shape[1], dtype=np.float32), 0.0
+    for _ in range(steps):
+        p = 1 / (1 + np.exp(-(X @ w + b)))
+        w -= lr * (X.T @ (p - y) / len(y) + l2 * w)
+        b -= lr * float(np.mean(p - y))
+    return lambda Z: 1 / (1 + np.exp(-(Z @ w + b)))
+
+
+def _router(fit, test, names, costs, epsilons, delta, seed):
+    """Learned small-vs-large router: train on half of `fit`, pick its threshold by Learn-then-Test
+    on the other half, report on `test`. Returns {eps: point}."""
+    small, large = len(names) - 2, len(names) - 1
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(fit))
+    train, cal = [fit[i] for i in idx[: len(fit) // 2]], [fit[i] for i in idx[len(fit) // 2:]]
+    _, ok_train, _ = _arrays(train, names, [1.0] * len(names))
+    score = _logreg(_features([r["state"] for r in train]), ok_train[small].astype(np.float32))
+
+    def point(rows, t):
+        _, ok, ms = _arrays(rows, names, [1.0] * len(names))
+        go_small = score(_features([r["state"] for r in rows])) >= t
+        cost = np.where(go_small, costs[small], costs[large])
+        lat = np.where(go_small, ms[small], ms[large])
+        wrong = np.where(go_small, ~ok[small], ~ok[large])
+        return {"cost_1k": float(cost.mean() * 1000), "error": float(wrong.mean()),
+                "coverage": [float(np.mean(go_small)) if k == small else float(np.mean(~go_small)) if k == large else 0.0
+                             for k in range(len(names))],
+                "p50_ms": float(np.percentile(lat, 50)), "p99_ms": float(np.percentile(lat, 99))}
+
+    s_cal = score(_features([r["state"] for r in cal]))
+    grid = [*np.unique(np.quantile(s_cal, np.linspace(0, 1, 50))), np.inf]
+    out = {}
+    for eps in epsilons:
+        alpha, best = delta / len(grid), None
+        for t in grid:
+            p = point(cal, t)
+            if binom_pvalue(round(p["error"] * len(cal)), len(cal), eps) <= alpha and (best is None or p["cost_1k"] < best[1]):
+                best = (t, p["cost_1k"])
+        if best is not None:
+            out[eps] = {**point(test, best[0]), "threshold": float(best[0])}
+    return out
+
+
 def run(rows: list[dict], names: list[str], costs: list[float], epsilons=EPSILONS,
-        splits: int = 10, fit_frac: float = 0.5, delta: float = 0.01, seed: int = 0) -> dict:
+        splits: int = 10, fit_frac: float = 0.5, delta: float = 0.05, seed: int = 0) -> dict:
     n, k = len(rows), len(names)
     per_split = []
     for s in range(splits):
@@ -130,6 +188,8 @@ def run(rows: list[dict], names: list[str], costs: list[float], epsilons=EPSILON
                     continue
                 taus = chosen.thresholds if key == "cascade" else (SKIP, *chosen.thresholds)
                 out[key][eps] = {**_point(tc, tok, tms, costs, taus), "thresholds": taus}
+        if k >= 2 and all("state" in r for r in rows):
+            out["router"] = _router(fit, test, names, costs, epsilons, delta, seed + s)
         for j, name in enumerate(names):
             only = tuple(SKIP if i != j else 0.0 for i in range(k - 1)) if j < k - 1 else (SKIP,) * (k - 1)
             out["always"][name] = _point(tc, tok, tms, costs, only)
@@ -150,10 +210,10 @@ def _ms(values):
 
 def _summarise(per_split, names, epsilons):
     metrics = ("cost_1k", "error", "p50_ms", "p99_ms")
-    agg = {"cascade": {}, "llm_only": {}, "always": {}, "tiers": {}}
-    for key in ("cascade", "llm_only"):
+    agg = {"cascade": {}, "llm_only": {}, "router": {}, "always": {}, "tiers": {}}
+    for key in ("cascade", "llm_only", "router"):
         for eps in epsilons:
-            pts = [s[key][eps] for s in per_split if eps in s[key]]
+            pts = [s[key][eps] for s in per_split if eps in s.get(key, {})]
             if len(pts) == len(per_split):  # only targets reachable on every split
                 agg[key][eps] = {m: _ms([p[m] for p in pts]) for m in metrics}
                 agg[key][eps]["coverage"] = np.mean([p["coverage"] for p in pts], axis=0).tolist()
@@ -167,23 +227,71 @@ def _summarise(per_split, names, epsilons):
     return agg
 
 
-def tier_summary(rows: list[dict], name: str, risks=(0.01, 0.02, 0.05)) -> dict:
-    """One tier alone: accuracy, ECE, AURC, and how much traffic it could answer at each error rate.
+def tier_summary(rows: list[dict], name: str, epsilons=(0.05, 0.1), splits: int = 10,
+                 delta: float = 0.05, seed: int = 0) -> dict:
+    """One tier alone: accuracy, ECE, AURC, and how much traffic it can answer on held-out data.
 
-    Coverage at risk r = largest share of requests, most confident first, whose error stays <= r.
-    In-sample and uncalibrated, so treat it as an optimistic first look, not a threshold.
+    Per split: pick the lowest confidence threshold whose selective error is <= ε by Learn-then-Test
+    on one half, then measure the share answered (coverage) and its error on the other half.
     """
     conf, correct, _ = _arrays(rows, [name], [1.0])
-    cov, risk, aurc = risk_coverage(conf[0], correct[0])
-    return {"n": len(rows), "accuracy": float(correct[0].mean()), "ece": _ece(rows, name), "aurc": aurc,
-            "coverage_at_risk": {r: float(cov[risk <= r].max()) if np.any(risk <= r) else 0.0 for r in risks}}
+    conf, correct = conf[0], correct[0]
+    n, held_out = len(rows), {}
+    for eps in epsilons:
+        cov, err = [], []
+        for s in range(splits):
+            idx = np.random.default_rng(seed + s).permutation(n)
+            a, b = idx[: n // 2], idx[n // 2:]
+            grid = np.unique(np.quantile(conf[a], np.linspace(0, 1, 50)))
+            ok = [t for t in grid if (m := conf[a] >= t).any()
+                  and binom_pvalue(int((~correct[a][m]).sum()), int(m.sum()), eps) <= delta / len(grid)]
+            if not ok:
+                cov.append(0.0)
+                continue
+            m = conf[b] >= min(ok)
+            cov.append(float(m.mean()))
+            err.append(float((~correct[b][m]).mean()))
+        held_out[eps] = {"coverage": _ms(cov), "error": _ms(err) if err else None,
+                         "worst_error": max(err) if err else None, "feasible": len(err)}
+    return {"n": n, "accuracy": float(correct.mean()), "ece": _ece(rows, name),
+            "aurc": risk_coverage(conf, correct)[2], "held_out": held_out}
+
+
+SYNTHETIC_TIERS, SYNTHETIC_COSTS = ["d1", "small", "large"], [0.0001, 0.001, 0.01]
+
+
+def synthetic_rows(n=3000, seed=0):
+    """Demo/test data, not a measurement: cache rows for 3 tiers on one yes/no question.
+
+    The small LLM is overconfident (T≈2).
+
+    d1 errs ~15%, close to the real d1-3B on AG News (13.4%). With a much weaker tier 0 (~34%),
+    Learn-then-Test's larger 3-tier search correction makes the cascade cost more than LLM-only.
+    """
+    rng = np.random.default_rng(seed)
+    d = rng.uniform(-3, 3, n)
+    rows = []
+    for i in range(n):
+        truth = "true" if rng.uniform() < 0.5 else "false"
+        row = {"truth": {"q": truth}, "tiers": {}}
+        for name, skill, sharpen, ms in zip(SYNTHETIC_TIERS, (2.5, 2.0, 5.0), (1.0, 2.0, 1.0), (10, 200, 900)):
+            p_right = 1 / (1 + np.exp(-(skill - d[i] + rng.normal(0, 0.5))))
+            right = rng.uniform() < p_right
+            p_label = 1 / (1 + np.exp(-sharpen * np.log(p_right / (1 - p_right))))  # reported confidence
+            other = "false" if truth == "true" else "true"
+            said, alt = (truth, other) if right else (other, truth)
+            row["tiers"][name] = {"answers": {"q": {said: float(max(p_label, 1 - p_label)),
+                                                    alt: float(min(p_label, 1 - p_label))}},
+                                  "ms": float(ms * rng.uniform(0.8, 1.2))}
+        rows.append(row)
+    return rows
 
 
 # --- 3. report ---------------------------------------------------------------
 
 CSS = """
-:root{--bg:#fff;--fg:#1a1a1a;--muted:#666;--line:#e3e3e3;--s1:#2a78d6;--s2:#eb6834;--pt:#555}
-@media (prefers-color-scheme:dark){:root{--bg:#1a1a19;--fg:#f0efec;--muted:#a3a29a;--line:#333;--s1:#3987e5;--s2:#d95926;--pt:#c3c2b7}}
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#666;--line:#e3e3e3;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--pt:#555}
+@media (prefers-color-scheme:dark){:root{--bg:#1a1a19;--fg:#f0efec;--muted:#a3a29a;--line:#333;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--pt:#c3c2b7}}
 body{background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 16px}
 .note{border-left:4px solid var(--s2);padding:8px 12px;background:color-mix(in srgb,var(--s2) 10%,transparent)}
 table{border-collapse:collapse;width:100%;margin:1rem 0 2rem}th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--line)}
@@ -200,7 +308,8 @@ def _pm(m, fmt="{:.3f}"):
 def _chart(summary, names) -> str:
     """Pareto chart: x = error, y = cost per 1k requests (log). Lines = cascades over ε, dots = baselines."""
     w, h, pad = 720, 380, 56
-    series = [("CASCADE-D", "var(--s1)", summary["cascade"]), ("LLM-only cascade", "var(--s2)", summary["llm_only"])]
+    series = [("CASCADE-D", "var(--s1)", summary["cascade"]), ("LLM-only cascade", "var(--s2)", summary["llm_only"]),
+              ("Learned router", "var(--s3)", summary.get("router", {}))]
     pts = [(p["error"]["mean"], p["cost_1k"]["mean"]) for _, _, d in series for p in d.values()]
     pts += [(p["error"]["mean"], p["cost_1k"]["mean"]) for p in summary["always"].values()]
     xmax = max(x for x, _ in pts) * 1.1 or 1
@@ -232,7 +341,9 @@ def _chart(summary, names) -> str:
     axes = (f'<text x="{w / 2}" y="{h - 12}" text-anchor="middle">end-to-end error (held-out)</text>'
             f'<text transform="translate(14 {h / 2}) rotate(-90)" text-anchor="middle">cost per 1k requests (log)</text>')
     legend = ('<div class=legend><span><i style="background:var(--s1)"></i>CASCADE-D</span>'
-              '<span><i style="background:var(--s2)"></i>LLM-only cascade</span><span>■ single-tier baselines</span></div>')
+              '<span><i style="background:var(--s2)"></i>LLM-only cascade</span>'
+              + ('<span><i style="background:var(--s3)"></i>Learned router</span>' if summary.get("router") else "")
+              + '<span>■ single-tier baselines</span></div>')
     return f'{legend}<svg viewBox="0 0 {w} {h}" role="img" aria-label="Cost versus error">{grid}{xt}{axes}{marks}</svg>'
 
 
@@ -252,6 +363,9 @@ def render(result: dict, title: str, note: str = "") -> str:
            "<th>p50 / p99 ms</th></tr>")
     tables = (f"<table><caption>CASCADE-D (tiers: {esc(' → '.join(names))})</caption>{hdr}{cascade_rows(s['cascade'])}</table>"
               f"<table><caption>LLM-only cascade (no tier 0)</caption>{hdr}{cascade_rows(s['llm_only'])}</table>")
+    if s.get("router"):
+        tables += (f"<table><caption>Learned router: {esc(names[-2])} or {esc(names[-1])}, chosen from the request text"
+                   f"</caption>{hdr}{cascade_rows(s['router'])}</table>")
     tables += ("<table><caption>Single-tier baselines</caption><tr><th>Baseline</th><th>Error</th><th>Cost / 1k</th>"
                "<th>p50 / p99 ms</th></tr>" + "".join(
                    f"<tr><td>always-{esc(n)}</td><td>{_pm(p['error'])}</td><td>{_pm(p['cost_1k'], '{:.3g}')}</td>"

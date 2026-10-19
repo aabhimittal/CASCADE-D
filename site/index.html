@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CASCADE-D</title>
+<meta name="description" content="Ask a small decision model first; escalate to an LLM only when it is unsure. Real d1-3B results on public datasets.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #ffffff; --ink: #1d2433; --muted: #5b6577; --line: #e2e6ee; --soft: #f3f5f9;
+  --answer: #2a78d6; --escalate: #eb6834;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #12151c; --ink: #e7eaf0; --muted: #9aa3b2; --line: #2a303c; --soft: #1a1e27;
+          --answer: #3987e5; --escalate: #d95926; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 17px/1.6 "IBM Plex Sans", system-ui, sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 56px 16px 80px; }
+h1, h2 { font-family: "IBM Plex Sans Condensed", "IBM Plex Sans", sans-serif; font-weight: 600; line-height: 1.1; letter-spacing: -0.01em; }
+h1 { font-size: clamp(2.4rem, 7vw, 4rem); margin: 0 0 20px; max-width: 13ch; }
+h2 { font-size: 1.6rem; margin: 72px 0 12px; }
+p { margin: 0 0 16px; max-width: 64ch; }
+.lede { font-size: 1.15rem; color: var(--muted); }
+a { color: var(--answer); text-underline-offset: 3px; }
+:focus-visible { outline: 3px solid var(--answer); outline-offset: 2px; }
+
+.lab { margin-top: 40px; padding: 24px; background: var(--soft); border-radius: 14px; }
+.datasets { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.datasets button { font: inherit; font-size: 0.95rem; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--ink); cursor: pointer; }
+.datasets button[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.task { color: var(--muted); margin-bottom: 20px; }
+label.slider { display: block; font-weight: 500; }
+input[type=range] { width: 100%; accent-color: var(--answer); margin: 10px 0 18px; }
+.readout { font-family: "IBM Plex Sans Condensed", sans-serif; font-size: clamp(1.35rem, 3.6vw, 1.75rem); line-height: 1.3; margin: 0 0 18px; max-width: none; }
+.readout b { font-weight: 600; }
+.readout .a { border-bottom: 3px solid var(--answer); }
+.readout .e { border-bottom: 3px solid var(--escalate); }
+svg { width: 100%; height: auto; display: block; }
+svg text { fill: var(--muted); font: 12px "IBM Plex Sans", sans-serif; }
+.examples { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 18px; }
+@media (max-width: 640px) { .examples { grid-template-columns: 1fr; } }
+.examples h3 { font-size: 0.95rem; font-weight: 500; margin: 0 0 8px; padding-left: 10px; }
+.examples .side-a h3 { border-left: 4px solid var(--answer); }
+.examples .side-e h3 { border-left: 4px solid var(--escalate); }
+.examples ul { list-style: none; margin: 0; padding: 0; }
+.examples li { padding: 10px 0; border-top: 1px solid var(--line); font-size: 0.92rem; }
+.examples .meta { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
+.note { font-size: 0.9rem; color: var(--muted); margin-top: 18px; }
+
+table { border-collapse: collapse; width: 100%; font-size: 0.95rem; margin-top: 8px; }
+th, td { text-align: right; padding: 8px 6px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--muted); font-weight: 500; vertical-align: bottom; }
+.scroll { overflow-x: auto; }
+ol.flow { padding-left: 1.3em; max-width: 64ch; }
+ol.flow li { margin-bottom: 10px; }
+footer { margin-top: 72px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Most decisions never need an LLM.</h1>
+  <p class="lede">CASCADE-D asks a small decision model first. It answers classify, route and score requests directly when it is confident, and only the rest go on to a small LLM, then a large one. Below is the real d1-3B decision model on public datasets with human labels.</p>
+
+  <section class="lab" aria-labelledby="lab-title">
+    <h2 id="lab-title" style="margin-top:0">Move the line</h2>
+    <div class="datasets" role="group" aria-label="Dataset" id="datasets"></div>
+    <p class="task" id="task"></p>
+    <label class="slider" for="threshold">Escalate anything d1 is less than <span id="tval"></span> sure about</label>
+    <input type="range" id="threshold" min="0" max="1" step="0.005">
+    <p class="readout" id="readout" aria-live="polite"></p>
+    <svg id="curve" viewBox="0 0 700 260" role="img" aria-labelledby="curve-desc"><desc id="curve-desc">Error rate of the answered requests against the share d1 answers. The shaded part is escalated to an LLM.</desc></svg>
+    <div class="examples">
+      <div class="side-a"><h3>Just above the line: d1 answers</h3><ul id="above"></ul></div>
+      <div class="side-e"><h3>Just below the line: sent to an LLM</h3><ul id="below"></ul></div>
+    </div>
+    <p class="note">These numbers are measured on the same examples you are looking at, so they flatter d1 a little. The table below picks thresholds on one half and measures on the other.</p>
+  </section>
+
+  <h2>Measured on held-out data</h2>
+  <p>For each dataset, a threshold is chosen on 500 examples so that, with 95% confidence, the error of what d1 answers stays under the target. It is then measured on the other 500. Ten random splits; mean ± spread.</p>
+  <div class="scroll"><table id="results"></table></div>
+  <p class="note">The thresholds come from Learn-then-Test: every candidate threshold is a statistical test, corrected for how many were tried. Where a target can't be guaranteed from 500 examples, no threshold is picked and d1 answers nothing.</p>
+
+  <h2>How a request moves through the cascade</h2>
+  <ol class="flow">
+    <li>The decision model (d1-3B, about 10 ms on a GPU) reads the request and gives a probability for every option. If its top option clears the threshold, that is the answer.</li>
+    <li>Otherwise a small LLM answers the same typed question. Its confidence comes from token probabilities, calibrated on validation data, not from what it says about itself.</li>
+    <li>Whatever is still uncertain goes to a large LLM, which always answers.</li>
+  </ol>
+  <p>Thresholds are chosen per target error: you say how many mistakes you can live with, and the optimizer finds the cheapest cascade that stays under it.</p>
+
+  <h2>What has not been measured yet</h2>
+  <p>The LLM tiers have not been run on real data, because that needs API keys. So the headline question, whether adding d1 makes the whole cascade cheaper than an LLM-only cascade at the same error, is still open. <a href="synthetic-cascade.html">The full cascade report on synthetic data</a> shows what that answer will look like.</p>
+  <p>On synthetic data, d1 only pays off when it is good enough: with tier-0 error around 15% the cascade is 15–46% cheaper than LLM-only, with 34% error it costs more.</p>
+
+  <footer>
+    <p><a href="https://github.com/aabhimittal/CASCADE-D">Source, specification and benchmark scripts</a>. Datasets: AG News, SST-2 (Stanford Sentiment Treebank) and dair-ai/emotion, used for research evaluation. d1-3B is released by Liquid AI under the LFM Open License 1.0. d1-3B ran in bfloat16 on a 4-core CPU.</p>
+  </footer>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const pct = (x, d = 0) => (100 * x).toFixed(d) + "%";
+let data, cur;
+
+fetch("data.json").then((r) => r.json()).then((d) => {
+  data = d;
+  const keys = Object.keys(d);
+  if (!keys.length) { $("readout").textContent = "No benchmark data was built into this page."; return; }
+  for (const k of keys) {
+    const b = document.createElement("button");
+    b.textContent = d[k].title; b.dataset.key = k; b.setAttribute("aria-pressed", "false");
+    b.onclick = () => select(k);
+    $("datasets").append(b);
+  }
+  renderTable();
+  select(keys[0]);
+}).catch(() => { $("readout").textContent = "Couldn't load data.json. Build the site with python site/build.py."; });
+
+function select(key) {
+  cur = data[key];
+  for (const b of $("datasets").children) b.setAttribute("aria-pressed", String(b.dataset.key === key));
+  $("task").textContent = cur.task;
+  // cumulative errors down the confidence-sorted list
+  cur.cumErr = []; let e = 0;
+  for (const it of cur.items) { e += it[1] === it[2] ? 0 : 1; cur.cumErr.push(e); }
+  const lo = Math.floor(cur.items[cur.items.length - 1][0] * 100) / 100;
+  $("threshold").min = lo; $("threshold").value = 0.9;
+  update();
+}
+
+function answered(t) {  // items are sorted by confidence, descending
+  let k = 0; while (k < cur.items.length && cur.items[k][0] >= t) k++;
+  return k;
+}
+
+function update() {
+  const t = +$("threshold").value, n = cur.items.length, k = answered(t);
+  $("tval").textContent = pct(t, 1);
+  const err = k ? cur.cumErr[k - 1] / k : 0;
+  $("readout").innerHTML = k
+    ? `d1 answers <b class="a">${pct(k / n)}</b> of requests and gets <b>${pct(err, 1)}</b> of those wrong. The other <b class="e">${pct(1 - k / n)}</b> go to an LLM.`
+    : `d1 answers nothing at this threshold. All <b class="e">100%</b> go to an LLM.`;
+  drawCurve(k);
+  const row = (it) => `<li>${esc(it[3])}<div class="meta">d1 said ${esc(it[1])} at ${pct(it[0])} sure. ${it[1] === it[2] ? "Correct." : "Wrong: the label is " + esc(it[2]) + "."}</div></li>`;
+  $("above").innerHTML = cur.items.slice(Math.max(0, k - 4), k).reverse().map(row).join("") || "<li>Nothing is answered at this threshold.</li>";
+  $("below").innerHTML = cur.items.slice(k, k + 4).map(row).join("") || "<li>Nothing is escalated at this threshold.</li>";
+}
+
+function drawCurve(k) {
+  const W = 700, H = 260, L = 48, R = 12, T = 12, B = 40, n = cur.items.length;
+  const risk = cur.cumErr.map((e, i) => e / (i + 1));
+  const ymax = Math.max(0.05, Math.ceil(Math.max(...risk.slice(Math.floor(n * 0.02))) * 20) / 20);
+  const X = (c) => L + c * (W - L - R), Y = (r) => H - B - Math.min(r, ymax) / ymax * (H - T - B);
+  let path = "", step = Math.max(1, Math.floor(n / 300));
+  for (let i = Math.floor(n * 0.02); i < n; i += step) path += (path ? "L" : "M") + X((i + 1) / n).toFixed(1) + "," + Y(risk[i]).toFixed(1);
+  path += "L" + X(1) + "," + Y(risk[n - 1]).toFixed(1);
+  let grid = "";
+  for (let v = 0; v <= ymax + 1e-9; v += ymax / 4) grid += `<line x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--line)"/><text x="${L - 8}" y="${Y(v) + 4}" text-anchor="end">${pct(v)}</text>`;
+  for (let c = 0; c <= 1.0001; c += 0.25) grid += `<text x="${X(c)}" y="${H - B + 18}" text-anchor="middle">${pct(c)}</text>`;
+  const x = X(k / n);
+  $("curve").innerHTML = $("curve").querySelector("desc").outerHTML
+    + `<rect x="${x}" y="${T}" width="${Math.max(0, W - R - x)}" height="${H - T - B}" fill="var(--escalate)" opacity="0.12"/>`
+    + grid
+    + `<path d="${path}" fill="none" stroke="var(--answer)" stroke-width="2"/>`
+    + (k ? `<line x1="${x}" x2="${x}" y1="${T}" y2="${H - B}" stroke="var(--ink)" stroke-width="1.5"/><circle cx="${x}" cy="${Y(cur.cumErr[k - 1] / k)}" r="5" fill="var(--answer)" stroke="var(--bg)" stroke-width="2"/>` : "")
+    + `<text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle">share answered by d1, most confident first</text>`
+    + `<text transform="translate(12 ${(T + H - B) / 2}) rotate(-90)" text-anchor="middle">error of answered</text>`
+    + `<g id="hover"></g>`;
+  $("curve").onpointermove = (ev) => {
+    const r = $("curve").getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * W;
+    const c = Math.min(1, Math.max(1 / n, (px - L) / (W - L - R))), i = Math.round(c * n) - 1;
+    if (i < 0) return;
+    const hx = X((i + 1) / n), hy = Y(risk[i]);
+    $("hover").innerHTML = `<circle cx="${hx}" cy="${hy}" r="4" fill="none" stroke="var(--ink)"/><text x="${Math.min(hx + 8, W - 150)}" y="${Math.max(hy - 10, 24)}" style="fill:var(--ink)">${pct((i + 1) / n)} answered, ${pct(risk[i], 1)} wrong</text>`;
+  };
+  $("curve").onpointerleave = () => { $("hover").innerHTML = ""; };
+}
+
+function renderTable() {
+  const fmt = (h) => !h || !h.feasible ? "not reachable" : `${pct(h.coverage.mean)} ± ${pct(h.coverage.std)}<br><small>${pct(h.error.mean, 1)} wrong, worst ${pct(h.worst_error, 1)}</small>`;
+  let html = "<tr><th>Dataset</th><th>Accuracy</th><th>Calibration error</th><th>Answered at ≤5% error</th><th>Answered at ≤10% error</th></tr>";
+  for (const k in data) {
+    const s = data[k].summary, h = s.held_out;
+    html += `<tr><td>${esc(data[k].title)}<br><small>${s.n} examples</small></td><td>${pct(s.accuracy, 1)}</td><td>${s.ece.toFixed(3)}</td><td>${fmt(h["0.05"])}${h["0.05"].feasible < 10 && h["0.05"].feasible ? `<br><small>${h["0.05"].feasible}/10 splits</small>` : ""}</td><td>${fmt(h["0.1"])}</td></tr>`;
+  }
+  $("results").innerHTML = html;
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+$("threshold").addEventListener("input", () => cur && update());
+</script>
+</body>
+</html>
