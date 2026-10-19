@@ -83,6 +83,15 @@ Current pricing and logprob availability for each provider tier; d1-3B question 
 - **Jev** (TypeSafe) is hosted-only; weights not released as of Sept 2026. Not used in M0.
 - **LLM tiers** use the OpenAI-compatible `/chat/completions` endpoint with `logprobs: true, top_logprobs: 20, max_tokens: 1`. This works with OpenAI and self-hosted vLLM/llama.cpp servers. The Anthropic Messages API does not expose token logprobs, so Claude models cannot serve tiers 1–2 under this method without a different confidence source.
 - **Tier 0 on real data** (2026-10-18, `bench/ag_news.py --n 1000`, d1-3B bf16 on a 4-core CPU, LLM tiers not run): accuracy 86.6%, ECE 0.039 raw (fitted T = 1.11, so already near-calibrated), AURC 0.035, latency p50 467 ms / p99 1.8 s. Per class: Sports 97.6%, Business 90.0%, World 89.6%, Sci/Tech 69.1% (59/249 Sci/Tech items called Business). Held-out tier-0 coverage (threshold fitted on 500, measured on 500, 10 splits, Wilson δ = 0.01): ε = 5% → 58% ± 12% of traffic answered at 2.6% error; ε = 10% → 79% ± 3% at 6.5% error, but one split reached 11.2% (selection bias, as M2 warns); ε = 2% → unreachable with 500 fit examples, because the margin alone exceeds 2%.
+- **Learn-then-Test + more datasets** (2026-10-19, `bench/run.py`, d1-3B bf16 on CPU; held-out coverage = threshold picked by Learn-then-Test at δ = 0.05 on 50% of the data, measured on the other 50%, 10 splits). Learn-then-Test fixed the AG News overshoot (worst split at ε = 10% went from 11.2% to 9.9%) at the cost of coverage:
+
+  | dataset | n | accuracy | ECE | AURC | answered at ε = 5% | answered at ε = 10% |
+  |---|---|---|---|---|---|---|
+  | SST-2 (yes/no) | 872 | 93.0% | 0.032 | 0.015 | 70% ± 26% (9/10 splits) | 97% ± 2%, worst 8.7% |
+  | AG News (4-way) | 1000 | 86.6% | 0.039 | 0.035 | 35% ± 19% (8/10 splits) | 75% ± 3%, worst 9.9% |
+  | Emotion (6-way) | 1000 | 68.8% | 0.060 | 0.167 | not certifiable | not certifiable |
+
+  Emotion is the §10 risk made concrete: per-class accuracy falls to 32/78 on love and 12/37 on surprise, so no threshold can be certified and tier 0 should be skipped for that task family.
 - Still open: per-provider pricing (M2 needs it), TypeSafe adapter license.
 
 ## 12. Claude Code kickoff

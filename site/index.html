@@ -184,7 +184,7 @@ function drawCurve(k) {
 }
 
 function renderTable() {
-  const fmt = (h) => !h || !h.feasible ? "not reachable" : `${pct(h.coverage.mean)} ± ${pct(h.coverage.std)}<br><small>${pct(h.error.mean, 1)} wrong, worst ${pct(h.worst_error, 1)}</small>`;
+  const fmt = (h) => !h || !h.feasible ? "no safe threshold" : `${pct(h.coverage.mean)} ± ${pct(h.coverage.std)}<br><small>${pct(h.error.mean, 1)} wrong, worst ${pct(h.worst_error, 1)}</small>`;
   let html = "<tr><th>Dataset</th><th>Accuracy</th><th>Calibration error</th><th>Answered at ≤5% error</th><th>Answered at ≤10% error</th></tr>";
   for (const k in data) {
     const s = data[k].summary, h = s.held_out;
