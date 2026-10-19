@@ -15,7 +15,7 @@ than the best of them on validation.
 import math
 from dataclasses import dataclass, field
 from itertools import product
-from statistics import NormalDist
+from functools import lru_cache
 
 import numpy as np
 
@@ -65,32 +65,37 @@ def simulate(conf: np.ndarray, correct: np.ndarray, costs, thresholds) -> Result
     return Result(tuple(thresholds), float(cost.mean()), float(wrong.mean()), coverage, cost)
 
 
-def error_upper_bound(error: float, n: int, delta: float) -> float:
-    """One-sided Wilson upper bound on the true error rate at confidence 1 - delta."""
-    z = NormalDist().inv_cdf(1 - delta)
-    centre = error + z * z / (2 * n)
-    half = z * math.sqrt(error * (1 - error) / n + z * z / (4 * n * n))
-    return (centre + half) / (1 + z * z / n)
+def binom_pvalue(errors: int, n: int, epsilon: float) -> float:
+    """P(at most `errors` mistakes in n | true error = epsilon): small means the error is really below epsilon."""
+    i = np.arange(errors + 1)
+    lg = np.vectorize(math.lgamma)
+    logpmf = lg(n + 1) - lg(i + 1) - lg(n - i + 1) + i * math.log(epsilon) + (n - i) * math.log1p(-epsilon)
+    return float(min(1.0, np.exp(logpmf).sum()))
 
 
 def optimize(conf: np.ndarray, correct: np.ndarray, costs, epsilon: float,
-             delta: float = 0.01, grid: int = 50) -> Result:
-    """Cheapest thresholds whose validation error, plus a Wilson margin, stays <= epsilon.
+             delta: float = 0.05, grid: int = 50) -> Result:
+    """Cheapest thresholds whose true error is <= epsilon with probability >= 1 - delta.
 
-    The margin makes the target hold on unseen traffic, not just on the validation set.
+    Learn-then-Test (Angelopoulos et al., 2021): every threshold setting in the grid is a hypothesis
+    test of "error >= epsilon" with an exact binomial p-value, Bonferroni-corrected over the whole
+    grid. Correcting for the search itself is what stops the optimizer from picking a setting that
+    only looked good on this validation sample.
     """
-    # shortcut: the margin is per-config and ignores the grid search's own selection bias
-    # (no multiple-testing correction); switch to Learn-then-Test if held-out misses show up.
     n = conf.shape[1]
     candidates = [[0.0, *np.unique(np.quantile(c, np.linspace(0, 1, grid))), SKIP] for c in conf[:-1]]
+    settings = list(product(*candidates))
+    alpha = delta / len(settings)
+    pvalue = lru_cache(maxsize=None)(lambda k: binom_pvalue(k, n, epsilon))  # many settings share an error count
     best = None
-    for taus in product(*candidates):
+    for taus in settings:
         r = simulate(conf, correct, costs, taus)
-        if error_upper_bound(r.error, n, delta) <= epsilon and (best is None or r.cost < best.cost):
+        if (best is None or r.cost < best.cost) and pvalue(round(r.error * n)) <= alpha:
             best = r
     if best is None:
         floor = simulate(conf, correct, costs, (SKIP,) * (len(conf) - 1))
-        raise ValueError(f"no thresholds reach error <= {epsilon}; the last tier alone errs {floor.error:.4f}")
+        raise ValueError(f"no thresholds reach error <= {epsilon} at delta {delta} with n={n}; "
+                         f"the last tier alone errs {floor.error:.4f}")
     return best
 
 
