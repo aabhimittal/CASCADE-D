@@ -98,3 +98,33 @@ def test_calibrate_reports_ece_per_tier_on_held_out_data():
     r = calibrated[0].decide(ex[3000][0])
     assert isinstance(calibrated[0], CalibratedBackend) and r.tier == "overconfident"
     assert r.answers["team"].confidence < answers[3000].confidence
+
+
+def test_per_type_temperatures_fix_types_miscalibrated_differently():
+    """Yes/no answers overconfident (T=3), choice answers calibrated: one shared T can't fix both."""
+    rng = np.random.default_rng(4)
+    z = rng.normal(0, 1.5, 3000)
+    p_true = 1 / (1 + np.exp(-z))
+    yes_lab = ["true" if rng.uniform() < p else "false" for p in p_true]
+    shown = 1 / (1 + np.exp(-3.0 * z))  # overconfident yes/no
+    yes_ans = [Answer(probabilities={"true": float(p), "false": float(1 - p)}) for p in shown]
+    ch_ans, ch_lab = synthetic(3000, sharpen=1.0, seed=3)
+
+    noul = {"type": "noul", "instructions": "?"}
+    choice = {"type": "choice", "instructions": "?", "criteria": {o: o for o in OPTS}}
+    rows = [x for i in range(3000) for x in (("noul", yes_ans[i], yes_lab[i]), ("choice", ch_ans[i], ch_lab[i]))]
+
+    class Mixed(DecisionBackend):
+        name = "mixed"
+
+        def _decide(self, request):
+            return DecisionResponse(tier=self.name, answers={"q": rows[request.state][1]})
+
+    examples = [(DecisionRequest(state=i, questions={"q": noul if t == "noul" else choice}), {"q": y})
+                for i, (t, _, y) in enumerate(rows)]
+    _, shared = calibrate([Mixed()], examples[:3000], examples[3000:])
+    calibrated, per = calibrate([Mixed()], examples[:3000], examples[3000:], per_type=True)
+    t = per[0]["temperature"]
+    assert t["noul"] == pytest.approx(3.0, rel=0.2) and t["choice"] == pytest.approx(1.0, rel=0.2)
+    assert per[0]["ece_after"] < shared[0]["ece_after"]
+    assert calibrated[0].decide(examples[0][0]).answers["q"].confidence < rows[0][1].confidence

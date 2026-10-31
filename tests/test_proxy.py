@@ -155,3 +155,22 @@ def test_api_key_and_rate_limit():
     assert c.get("/dashboard").status_code == 401
     ok = {"Authorization": "Bearer s3cret"}
     assert [c.post("/v1/decide", json=req, headers=ok).status_code for _ in range(3)] == [200, 200, 429]
+
+
+def test_rate_limit_cannot_be_bypassed_with_fresh_headers():
+    tiers = [Fake("d1", ["easy"]), Fake("small", []), Fake("large", [])]
+    c = TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, rate_limit_per_minute=2))
+    codes = [c.post("/v1/decide", json={**DECIDE, "state": "easy"}, headers={"Authorization": f"Bearer x{i}"}).status_code
+             for i in range(3)]
+    assert codes == [200, 200, 429]
+
+
+def test_oversized_task_rejected_and_ledger_file_bounded(tmp_path):
+    tiers = [Fake("d1", ["easy"]), Fake("small", []), Fake("large", [])]
+    assert TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS)).post(
+        "/v1/decide", json={**DECIDE, "state": "easy", "task": "x" * 65}).status_code == 422
+    path = tmp_path / "l.jsonl"
+    ledger = Ledger(["a"], [1.0], maxlen=10, path=str(path))
+    for _ in range(55):
+        ledger.add(0, 1.0, 1.0)
+    assert len(path.read_text().splitlines()) < 20 and len(Ledger(["a"], [1.0], maxlen=10, path=str(path)).records) == 10

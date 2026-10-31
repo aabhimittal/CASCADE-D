@@ -92,15 +92,21 @@ def reliability(answers: list[Answer], labels: list[str], bins: int = 15) -> Rel
 
 
 class CalibratedBackend(DecisionBackend):
-    """Wraps a tier and temperature-scales every answer it returns."""
+    """Wraps a tier and temperature-scales every answer it returns.
 
-    # shortcut: one temperature per tier across noul/choice/score; fit per question type if their ECEs diverge
-    def __init__(self, backend: DecisionBackend, temperature: float):
+    `temperature` is one float, or {question type: float} ("noul", "choice", "score"); types missing
+    from the dict are left unscaled.
+    """
+
+    def __init__(self, backend: DecisionBackend, temperature: float | dict[str, float]):
         self.backend, self.temperature, self.name = backend, temperature, backend.name
+
+    def _t(self, qtype: str) -> float:
+        return self.temperature.get(qtype, 1.0) if isinstance(self.temperature, dict) else self.temperature
 
     def _decide(self, request: DecisionRequest) -> DecisionResponse:
         r = self.backend.decide(request)
-        answers = {k: scale(a, self.temperature) for k, a in r.answers.items()}
+        answers = {k: scale(a, self._t(request.questions[k].type)) for k, a in r.answers.items()}
         return r.model_copy(update={"answers": answers})
 
 
@@ -115,18 +121,37 @@ def collect(backend: DecisionBackend, examples: list[Example]) -> tuple[list[Ans
     return answers, labels
 
 
-def calibrate(backends: list[DecisionBackend], fit: list[Example], test: list[Example],
-              bins: int = 15) -> tuple[list[CalibratedBackend], list[dict]]:
-    """Fit a temperature per tier on `fit`, report ECE before and after on held-out `test`.
+def _types(examples: list[Example]) -> list[str]:
+    """Question type per (answer, label) pair, in collect()'s order."""
+    return [request.questions[name].type for request, truth in examples for name in truth]
 
-    Reporting on the fit set would understate ECE, so the two sets must not overlap.
+
+def calibrate(backends: list[DecisionBackend], fit: list[Example], test: list[Example],
+              bins: int = 15, per_type: bool = False,
+              min_per_type: int = 30) -> tuple[list[CalibratedBackend], list[dict]]:
+    """Fit temperatures per tier on `fit`, report ECE before and after on held-out `test`.
+
+    per_type=True fits one temperature per question type (yes/no answers are often calibrated
+    differently from 6-way choices); a type with fewer than `min_per_type` fit examples falls back
+    to the tier-wide temperature. Reporting on the fit set would understate ECE, so the two sets
+    must not overlap.
     """
     calibrated, rows = [], []
+    fit_types, test_types = _types(fit), _types(test)
     for b in backends:
-        t = fit_temperature(*collect(b, fit))
+        fit_answers, fit_labels = collect(b, fit)
+        t_all = fit_temperature(fit_answers, fit_labels)
+        t = t_all
+        if per_type:
+            t = {}
+            for qtype in sorted(set(fit_types) | set(test_types)):
+                idx = [i for i, q in enumerate(fit_types) if q == qtype]
+                t[qtype] = (fit_temperature([fit_answers[i] for i in idx], [fit_labels[i] for i in idx])
+                            if len(idx) >= min_per_type else t_all)
         answers, labels = collect(b, test)
+        scaled = [scale(a, t[q] if per_type else t) for a, q in zip(answers, test_types)]
         before = reliability(answers, labels, bins)
-        after = reliability([scale(a, t) for a in answers], labels, bins)
+        after = reliability(scaled, labels, bins)
         calibrated.append(CalibratedBackend(b, t))
         rows.append({"tier": b.name, "temperature": t, "n": len(labels),
                      "accuracy": float(np.mean([a.label == y for a, y in zip(answers, labels)])),

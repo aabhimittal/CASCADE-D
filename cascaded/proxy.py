@@ -47,7 +47,11 @@ def make_app(cascade: Cascade, costs: list[float], calibration: list[dict] | Non
             raise HTTPException(401, "missing or wrong API key")
         if rate_limit_per_minute:
             # shortcut: per-process memory; use a shared store (e.g. Redis) when running several workers
-            who, now = req.headers.get("authorization") or (req.client.host if req.client else "?"), time.monotonic()
+            # key on the client address, never on a header the client chooses (a fresh header per request
+            # would get a fresh bucket); drop idle buckets so memory stays bounded by active clients
+            who, now = req.client.host if req.client else "?", time.monotonic()
+            for k in [k for k, v in recent.items() if not v or now - v[-1] > 60]:
+                del recent[k]
             q = recent[who]
             while q and now - q[0] > 60:
                 q.popleft()

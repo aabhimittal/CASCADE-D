@@ -25,10 +25,13 @@ class Ledger:
         self.tier_names, self.costs, self.path = tier_names, costs, path
         self.expected = expected or {}  # {task: validation coverage per tier}, for drift checks
         self.records: deque[Record] = deque(maxlen=maxlen)
+        self._lines = 0
         if path:
             try:
                 with open(path) as f:
-                    self.records.extend(Record(**json.loads(line)) for line in f if line.strip())
+                    lines = [line for line in f if line.strip()]
+                self.records.extend(Record(**json.loads(line)) for line in lines)
+                self._lines = len(lines)
             except FileNotFoundError:
                 pass
 
@@ -38,6 +41,11 @@ class Ledger:
         if self.path:
             with open(self.path, "a") as f:  # shortcut: one open per request; batch writes at high QPS
                 f.write(json.dumps(asdict(r)) + "\n")
+            self._lines += 1
+            if self._lines >= 2 * self.records.maxlen:  # compact: the file never outgrows twice the window
+                with open(self.path, "w") as f:
+                    f.writelines(json.dumps(asdict(x)) + "\n" for x in self.records)
+                self._lines = len(self.records)
 
     def drift(self, min_requests: int = 50, z_alarm: float = 3.0) -> list[dict]:
         """Live vs validation coverage per task and tier. Label-free: a big shift means traffic no longer
@@ -91,6 +99,10 @@ th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}td.n{f
 """
 
 
+def _temps(t) -> str:
+    return ", ".join(f"{k} {v:.2f}" for k, v in t.items()) if isinstance(t, dict) else f"{t:.2f}"
+
+
 def _ms(v: float | None) -> str:
     return "—" if v is None else f"{v:.0f} ms"
 
@@ -122,7 +134,7 @@ def render(ledger: Ledger, calibration: list[dict] | None = None) -> str:
                  f"<th>Validation</th><th>Live</th><th>Requests</th><th>Status</th></tr>{rows}</table>")
     if calibration:
         cal = "".join(
-            f"<tr><td>{esc(r['tier'])}</td><td class=n>{r['temperature']:.2f}</td><td class=n>{r['ece_before']:.3f}</td>"
+            f"<tr><td>{esc(r['tier'])}</td><td class=n>{_temps(r['temperature'])}</td><td class=n>{r['ece_before']:.3f}</td>"
             f"<td class=n>{r['ece_after']:.3f}</td><td>{r['reliability'].svg(120)}</td></tr>" for r in calibration)
         body += ("<table><caption>Calibration (held-out)</caption><tr><th>Tier</th><th>T</th><th>ECE before</th>"
                  f"<th>ECE after</th><th>Reliability</th></tr>{cal}</table>")
