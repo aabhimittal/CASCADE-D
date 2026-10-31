@@ -10,6 +10,8 @@ Decision-model-first cascade: d1-3B answers typed questions when confident, esca
 - M4: `cascaded/benchmark.py` — caches every tier's answers once, then replays 10 fit/test splits: CASCADE-D vs an LLM-only cascade vs single-tier baselines, with a cost-vs-error Pareto chart. `bench/run.py` runs it on AG News, SST-2 and Emotion; real d1-3B outputs are cached in `data/`.
 - Thresholds come from Learn-then-Test (exact binomial tests, Bonferroni over the grid), so the error target holds on unseen traffic with probability ≥ 1 − δ. A learned text router (RouteLLM-style) is reported as a baseline.
 - `site/` builds the GitHub Pages demo from `data/`; CI runs the tests on every push and PR.
+- Per-task thresholds (`optimize_per_task`, `DecisionRequest.task`): a task where tier 0 is unreliable gets it skipped; unknown tasks go straight to the last tier. `optimize(method="pareto")` is a cheaper, less conservative alternative to Bonferroni; `required_n()` says how many labels a target needs.
+- Proxy hardening: `make_app(..., api_key=..., rate_limit_per_minute=..., ledger_path=..., expected_coverage=...)` adds a bearer key, a per-client limit, a ledger that survives restarts, and a drift table that flags when live traffic stops looking like validation.
 
 ```bash
 pip install -e ".[dev]"        # add ",d1" to run d1-3B locally, ",proxy" to serve
@@ -31,7 +33,7 @@ build_app = lambda: make_app(Cascade(tiers, thresholds=(0.92, 0.85)), costs)
 ```
 
 ```bash
-uvicorn --factory app:build_app   # then open http://localhost:8000/dashboard
+CASCADED_API_KEY=change-me uvicorn --factory app:build_app   # then open http://localhost:8000/dashboard
 ```
 
 Demo site locally: `PYTHONPATH=. python site/build.py --out _site && python -m http.server -d _site`.

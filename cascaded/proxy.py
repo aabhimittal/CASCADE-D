@@ -15,6 +15,7 @@ Run: uvicorn --factory "yourmodule:build_app"  where build_app returns make_app(
 import json
 import os
 import secrets
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
@@ -41,6 +42,7 @@ def make_app(cascade: Cascade, costs: list[float], calibration: list[dict] | Non
     ledger = Ledger(names, costs, path=ledger_path, expected=expected_coverage)
     api_key = api_key or os.environ.get("CASCADED_API_KEY")
     recent: dict[str, deque] = defaultdict(deque)
+    recent_lock = threading.Lock()  # sync endpoints run on FastAPI's thread pool
 
     def guard(req: Request) -> None:
         if api_key and not secrets.compare_digest(req.headers.get("authorization", ""), f"Bearer {api_key}"):
@@ -50,14 +52,17 @@ def make_app(cascade: Cascade, costs: list[float], calibration: list[dict] | Non
             # key on the client address, never on a header the client chooses (a fresh header per request
             # would get a fresh bucket); drop idle buckets so memory stays bounded by active clients
             who, now = req.client.host if req.client else "?", time.monotonic()
-            for k in [k for k, v in recent.items() if not v or now - v[-1] > 60]:
-                del recent[k]
-            q = recent[who]
-            while q and now - q[0] > 60:
-                q.popleft()
-            if len(q) >= rate_limit_per_minute:
+            with recent_lock:
+                for k in [k for k, v in recent.items() if not v or now - v[-1] > 60]:
+                    recent.pop(k, None)
+                q = recent[who]
+                while q and now - q[0] > 60:
+                    q.popleft()
+                limited = len(q) >= rate_limit_per_minute
+                if not limited:
+                    q.append(now)
+            if limited:
                 raise HTTPException(429, "rate limit exceeded, retry in a minute")
-            q.append(now)
 
     app = FastAPI(title="CASCADE-D", dependencies=[Depends(guard)])
     app.state.ledger = ledger

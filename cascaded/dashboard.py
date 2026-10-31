@@ -3,6 +3,8 @@
 import html
 import json
 import math
+import os
+import threading
 from collections import deque
 from dataclasses import asdict, dataclass
 
@@ -26,25 +28,34 @@ class Ledger:
         self.expected = expected or {}  # {task: validation coverage per tier}, for drift checks
         self.records: deque[Record] = deque(maxlen=maxlen)
         self._lines = 0
+        self._lock = threading.Lock()  # proxy endpoints run on a thread pool
         if path:
             try:
                 with open(path) as f:
                     lines = [line for line in f if line.strip()]
-                self.records.extend(Record(**json.loads(line)) for line in lines)
-                self._lines = len(lines)
             except FileNotFoundError:
-                pass
+                lines = []
+            for line in lines:
+                try:
+                    self.records.append(Record(**json.loads(line)))
+                except (ValueError, TypeError):  # a torn last line from a crash: skip it, keep the rest
+                    pass
+            self._lines = len(lines)
 
     def add(self, tier: int, cost: float, latency_ms: float, task: str | None = None) -> None:
         r = Record(tier, cost, latency_ms, task)
-        self.records.append(r)
-        if self.path:
+        with self._lock:
+            self.records.append(r)
+            if not self.path:
+                return
             with open(self.path, "a") as f:  # shortcut: one open per request; batch writes at high QPS
                 f.write(json.dumps(asdict(r)) + "\n")
             self._lines += 1
             if self._lines >= 2 * self.records.maxlen:  # compact: the file never outgrows twice the window
-                with open(self.path, "w") as f:
-                    f.writelines(json.dumps(asdict(x)) + "\n" for x in self.records)
+                tmp = self.path + ".tmp"
+                with open(tmp, "w") as f:
+                    f.writelines(json.dumps(asdict(x)) + "\n" for x in list(self.records))
+                os.replace(tmp, self.path)  # atomic: a crash leaves the old file or the new one, never half
                 self._lines = len(self.records)
 
     def drift(self, min_requests: int = 50, z_alarm: float = 3.0) -> list[dict]:

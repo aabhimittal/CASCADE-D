@@ -174,3 +174,21 @@ def test_oversized_task_rejected_and_ledger_file_bounded(tmp_path):
     for _ in range(55):
         ledger.add(0, 1.0, 1.0)
     assert len(path.read_text().splitlines()) < 20 and len(Ledger(["a"], [1.0], maxlen=10, path=str(path)).records) == 10
+
+
+def test_concurrent_requests_are_safe(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    path = tmp_path / "l.jsonl"
+    ledger = Ledger(["a"], [1.0], maxlen=20, path=str(path))
+    with ThreadPoolExecutor(16) as pool:
+        list(pool.map(lambda _: ledger.add(0, 1.0, 1.0), range(400)))
+    lines = path.read_text().splitlines()
+    assert all(json.loads(line)["tier"] == 0 for line in lines) and len(lines) < 40
+    path.write_text(path.read_text() + '{"tier": 0, "cost": 1')  # torn write from a crash
+    assert len(Ledger(["a"], [1.0], maxlen=20, path=str(path)).records) == 20
+
+    tiers = [Fake("d1", ["easy"]), Fake("small", []), Fake("large", [])]
+    c = TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, rate_limit_per_minute=1000))
+    with ThreadPoolExecutor(16) as pool:
+        codes = list(pool.map(lambda _: c.post("/v1/decide", json={**DECIDE, "state": "easy"}).status_code, range(200)))
+    assert codes.count(200) == 200

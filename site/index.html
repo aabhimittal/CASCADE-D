@@ -101,7 +101,7 @@ footer { margin-top: 72px; padding-top: 20px; border-top: 1px solid var(--line);
   <p>On synthetic data, d1 only pays off when it is good enough: with tier-0 error around 15% the cascade is 15–46% cheaper than LLM-only, with 34% error it costs more.</p>
 
   <footer>
-    <p><a href="https://github.com/aabhimittal/CASCADE-D">Source, specification and benchmark scripts</a>. Datasets: AG News, SST-2 (Stanford Sentiment Treebank) and dair-ai/emotion, used for research evaluation. d1-3B is released by Liquid AI under the LFM Open License 1.0. d1-3B ran in bfloat16 on a 4-core CPU.</p>
+    <p><a href="https://github.com/aabhimittal/CASCADE-D">Source, specification and benchmark scripts</a>. Example text comes from AG News, SST-2 (Stanford Sentiment Treebank) and dair-ai/emotion, shown here for non-commercial research only: AG News is provided for research and non-commercial use, emotion for educational and research use, and SST-2 lists no licence. Rebuild with <code>site/build.py --no-text</code> to publish the numbers without the text. d1-3B is released by Liquid AI under the LFM Open License 1.0. d1-3B ran in bfloat16 on a 4-core CPU (about 400 ms per decision); Liquid AI reports 8–16 ms on a single GPU, which we have not measured.</p>
   </footer>
 </main>
 <script>
