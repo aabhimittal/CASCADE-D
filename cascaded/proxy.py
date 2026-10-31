@@ -13,10 +13,13 @@ Run: uvicorn --factory "yourmodule:build_app"  where build_app returns make_app(
 """
 
 import json
+import os
+import secrets
 import time
 import uuid
+from collections import defaultdict, deque
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import ValidationError
 
@@ -25,23 +28,46 @@ from cascaded.optimizer import SKIP, Cascade
 from cascaded.schema import DecisionRequest, DecisionResponse
 
 
-def make_app(cascade: Cascade, costs: list[float], calibration: list[dict] | None = None) -> FastAPI:
+def make_app(cascade: Cascade, costs: list[float], calibration: list[dict] | None = None,
+             ledger_path: str | None = None, expected_coverage: dict | None = None,
+             api_key: str | None = None, rate_limit_per_minute: int | None = None) -> FastAPI:
+    """expected_coverage: {task: Result.coverage} from validation, enables the drift table.
+    api_key (or env CASCADED_API_KEY): if set, every endpoint needs "Authorization: Bearer <key>"."""
     if len(costs) != len(cascade.tiers):
         raise ValueError("one cost per tier")
     names = [t.name for t in cascade.tiers]
     if len(set(names)) != len(names):
         raise ValueError(f"tier names must be unique (they identify who answered): {names}")
-    # cost of a request answered by tier k = every non-skipped tier up to and including k
-    paid = [sum(c for c, tau in zip(costs[: k + 1], cascade.thresholds) if tau != SKIP) for k in range(len(costs))]
-    ledger = Ledger(names, costs)
-    app = FastAPI(title="CASCADE-D")
+    ledger = Ledger(names, costs, path=ledger_path, expected=expected_coverage)
+    api_key = api_key or os.environ.get("CASCADED_API_KEY")
+    recent: dict[str, deque] = defaultdict(deque)
+
+    def guard(req: Request) -> None:
+        if api_key and not secrets.compare_digest(req.headers.get("authorization", ""), f"Bearer {api_key}"):
+            raise HTTPException(401, "missing or wrong API key")
+        if rate_limit_per_minute:
+            # shortcut: per-process memory; use a shared store (e.g. Redis) when running several workers
+            who, now = req.headers.get("authorization") or (req.client.host if req.client else "?"), time.monotonic()
+            q = recent[who]
+            while q and now - q[0] > 60:
+                q.popleft()
+            if len(q) >= rate_limit_per_minute:
+                raise HTTPException(429, "rate limit exceeded, retry in a minute")
+            q.append(now)
+
+    app = FastAPI(title="CASCADE-D", dependencies=[Depends(guard)])
     app.state.ledger = ledger
+
+    def paid(task: str | None, k: int) -> float:
+        """Cost of a request answered by tier k: every tier it passed through (skipped tiers are free)."""
+        taus = cascade.thresholds_for(task)
+        return sum(c for c, tau in zip(costs[: k + 1], taus) if tau != SKIP)
 
     def run(request: DecisionRequest) -> DecisionResponse:
         start = time.perf_counter()
         response = cascade.decide(request)
         k = names.index(response.tier)
-        ledger.add(k, paid[k], (time.perf_counter() - start) * 1000)
+        ledger.add(k, paid(request.task, k), (time.perf_counter() - start) * 1000, request.task)
         return response
 
     @app.post("/v1/decide")
@@ -95,7 +121,8 @@ def _to_decision_request(body: dict) -> tuple[DecisionRequest, set[str]]:
             raise HTTPException(400, f"property {name!r}: only string enums and booleans are supported")
     state = "\n\n".join(f"{m.get('role', 'user')}: {_text(m.get('content'))}" for m in body.get("messages", []))
     try:
-        return DecisionRequest(state=state, questions=questions), booleans
+        task = (body.get("metadata") or {}).get("task")  # OpenAI's free-form metadata field
+        return DecisionRequest(state=state, questions=questions, task=task), booleans
     except ValidationError as e:
         raise HTTPException(400, str(e)) from e
 

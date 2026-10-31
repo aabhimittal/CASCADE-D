@@ -108,3 +108,50 @@ def test_dashboard_escapes_tier_names_and_embeds_calibration():
     page = render(ledger, [{"tier": "d1", "temperature": 1.5, "ece_before": 0.12, "ece_after": 0.02, "reliability": rel}])
     assert "<b>evil</b>" not in page and "&lt;b&gt;evil&lt;/b&gt;" in page
     assert "<svg" in page and "0.120" in page
+
+
+def test_per_task_costs_in_ledger():
+    tiers = [Fake("d1", ["easy"]), Fake("small", ["easy", "medium"]), Fake("large", [])]
+    c = TestClient(make_app(Cascade(tiers, {"routing": (0.9, 0.9), "emotion": (SKIP, 0.9)}), COSTS))
+    c.post("/v1/decide", json={**DECIDE, "state": "easy", "task": "routing"})   # d1 answers: 0.01
+    c.post("/v1/decide", json={**DECIDE, "state": "easy", "task": "emotion"})   # d1 skipped, small: 1.0
+    c.post("/v1/decide", json={**DECIDE, "state": "easy", "task": "unknown"})   # straight to large: 10.0
+    assert c.get("/stats").json()["mean_cost"] == pytest.approx((0.01 + 1.0 + 10.0) / 3)
+
+
+def test_openai_metadata_task_is_used():
+    tiers = [Fake("d1", ["easy"]), Fake("small", ["easy"]), Fake("large", [])]
+    c = TestClient(make_app(Cascade(tiers, {"routing": (0.9, 0.9)}), COSTS))
+    body = openai_body({"team": {"type": "string", "enum": ["billing", "technical"]}})
+    assert c.post("/v1/chat/completions", json={**body, "metadata": {"task": "routing"}}).json()["model"] == "d1"
+    assert c.post("/v1/chat/completions", json=body).json()["model"] == "large"  # no task: not validated
+
+
+def test_drift_alarm_when_live_coverage_departs_from_validation():
+    tiers = [Fake("d1", ["easy"]), Fake("small", ["easy", "medium"]), Fake("large", [])]
+    app = make_app(Cascade(tiers, (0.9, 0.9)), COSTS, expected_coverage={None: [0.8, 0.1, 0.1]})
+    c = TestClient(app)
+    for _ in range(60):  # live traffic is all "hard": d1 answers nothing, unlike validation's 80%
+        c.post("/v1/decide", json={**DECIDE, "state": "hard"})
+    drift = {d["tier"]: d for d in c.get("/stats").json()["drift"]}
+    assert drift["d1"]["alarm"] and drift["d1"]["observed"] == 0.0
+    assert "recalibrate" in c.get("/dashboard").text
+
+
+def test_ledger_persists_across_restarts(tmp_path):
+    path = str(tmp_path / "ledger.jsonl")
+    tiers = [Fake("d1", ["easy"]), Fake("small", []), Fake("large", [])]
+    TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, ledger_path=path)).post(
+        "/v1/decide", json={**DECIDE, "state": "easy"})
+    again = TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, ledger_path=path))
+    assert again.get("/stats").json()["requests"] == 1
+
+
+def test_api_key_and_rate_limit():
+    tiers = [Fake("d1", ["easy"]), Fake("small", []), Fake("large", [])]
+    c = TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, api_key="s3cret", rate_limit_per_minute=2))
+    req = {**DECIDE, "state": "easy"}
+    assert c.post("/v1/decide", json=req).status_code == 401
+    assert c.get("/dashboard").status_code == 401
+    ok = {"Authorization": "Bearer s3cret"}
+    assert [c.post("/v1/decide", json=req, headers=ok).status_code for _ in range(3)] == [200, 200, 429]

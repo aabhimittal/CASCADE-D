@@ -1,8 +1,10 @@
 """M3: request ledger and a self-contained static HTML cost dashboard (no JS, no CDN)."""
 
 import html
+import json
+import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import numpy as np
 
@@ -12,16 +14,46 @@ class Record:
     tier: int          # index of the tier that answered
     cost: float        # summed cost of every tier the request passed through
     latency_ms: float
+    task: str | None = None
 
 
 class Ledger:
-    # shortcut: in-memory ring buffer, lost on restart; persist to a file/DB once traffic matters
-    def __init__(self, tier_names: list[str], costs: list[float], maxlen: int = 100_000):
-        self.tier_names, self.costs = tier_names, costs
-        self.records: deque[Record] = deque(maxlen=maxlen)
+    """Recent requests, optionally persisted as JSONL so stats survive restarts."""
 
-    def add(self, tier: int, cost: float, latency_ms: float) -> None:
-        self.records.append(Record(tier, cost, latency_ms))
+    def __init__(self, tier_names: list[str], costs: list[float], maxlen: int = 100_000,
+                 path: str | None = None, expected: dict | None = None):
+        self.tier_names, self.costs, self.path = tier_names, costs, path
+        self.expected = expected or {}  # {task: validation coverage per tier}, for drift checks
+        self.records: deque[Record] = deque(maxlen=maxlen)
+        if path:
+            try:
+                with open(path) as f:
+                    self.records.extend(Record(**json.loads(line)) for line in f if line.strip())
+            except FileNotFoundError:
+                pass
+
+    def add(self, tier: int, cost: float, latency_ms: float, task: str | None = None) -> None:
+        r = Record(tier, cost, latency_ms, task)
+        self.records.append(r)
+        if self.path:
+            with open(self.path, "a") as f:  # shortcut: one open per request; batch writes at high QPS
+                f.write(json.dumps(asdict(r)) + "\n")
+
+    def drift(self, min_requests: int = 50, z_alarm: float = 3.0) -> list[dict]:
+        """Live vs validation coverage per task and tier. Label-free: a big shift means traffic no longer
+        looks like the validation set, so the error guarantee no longer applies. Normal approximation."""
+        out = []
+        for task, expected in self.expected.items():
+            tiers = [r.tier for r in self.records if r.task == task]
+            if len(tiers) < min_requests:
+                continue
+            for k, exp in enumerate(expected):
+                obs = sum(t == k for t in tiers) / len(tiers)
+                sd = math.sqrt(max(exp * (1 - exp), 1e-9) / len(tiers))
+                z = (obs - exp) / sd
+                out.append({"task": task, "tier": self.tier_names[k], "expected": exp, "observed": obs,
+                            "n": len(tiers), "z": z, "alarm": abs(z) >= z_alarm})
+        return out
 
     def summary(self) -> dict:
         n = len(self.records)
@@ -32,6 +64,7 @@ class Ledger:
         lat = np.array([r.latency_ms for r in self.records])
         baseline = self.costs[-1]  # always-large: every request goes straight to the last tier
         return {
+            "drift": self.drift(),
             "requests": n,
             "mean_cost": float(cost.mean()),
             "baseline_cost": baseline,
@@ -79,6 +112,14 @@ def render(ledger: Ledger, calibration: list[dict] | None = None) -> str:
         body = ("<div class=kpis>" + "".join(f"<div class=kpi><span>{k}</span><b>{v}</b></div>" for k, v in kpis)
                 + "</div><table><caption>Who answered</caption><tr><th>Tier</th><th>Requests</th><th>Share</th>"
                 f"<th></th><th>p50</th></tr>{rows}</table>")
+    drift = ledger.drift()
+    if drift:
+        rows = "".join(
+            f"<tr><td>{esc(str(d['task'] or 'all'))}</td><td>{esc(d['tier'])}</td><td class=n>{d['expected']:.1%}</td>"
+            f"<td class=n>{d['observed']:.1%}</td><td class=n>{d['n']:,}</td>"
+            f"<td>{'⚠ recalibrate: traffic has shifted' if d['alarm'] else 'ok'}</td></tr>" for d in drift)
+        body += ("<table><caption>Drift: who answers now vs on validation</caption><tr><th>Task</th><th>Tier</th>"
+                 f"<th>Validation</th><th>Live</th><th>Requests</th><th>Status</th></tr>{rows}</table>")
     if calibration:
         cal = "".join(
             f"<tr><td>{esc(r['tier'])}</td><td class=n>{r['temperature']:.2f}</td><td class=n>{r['ece_before']:.3f}</td>"

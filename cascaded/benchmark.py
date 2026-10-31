@@ -132,7 +132,7 @@ def _logreg(X, y, l2=1e-2, steps=300, lr=0.5):
     return lambda Z: 1 / (1 + np.exp(-(Z @ w + b)))
 
 
-def _router(fit, test, names, costs, epsilons, delta, seed):
+def _router(fit, test, names, costs, epsilons, delta, seed, featurize=_features):
     """Learned small-vs-large router: train on half of `fit`, pick its threshold by Learn-then-Test
     on the other half, report on `test`. Returns {eps: point}."""
     small, large = len(names) - 2, len(names) - 1
@@ -140,11 +140,11 @@ def _router(fit, test, names, costs, epsilons, delta, seed):
     idx = rng.permutation(len(fit))
     train, cal = [fit[i] for i in idx[: len(fit) // 2]], [fit[i] for i in idx[len(fit) // 2:]]
     _, ok_train, _ = _arrays(train, names, [1.0] * len(names))
-    score = _logreg(_features([r["state"] for r in train]), ok_train[small].astype(np.float32))
+    score = _logreg(featurize([r["state"] for r in train]), ok_train[small].astype(np.float32))
 
     def point(rows, t):
         _, ok, ms = _arrays(rows, names, [1.0] * len(names))
-        go_small = score(_features([r["state"] for r in rows])) >= t
+        go_small = score(featurize([r["state"] for r in rows])) >= t
         cost = np.where(go_small, costs[small], costs[large])
         lat = np.where(go_small, ms[small], ms[large])
         wrong = np.where(go_small, ~ok[small], ~ok[large])
@@ -153,7 +153,7 @@ def _router(fit, test, names, costs, epsilons, delta, seed):
                              for k in range(len(names))],
                 "p50_ms": float(np.percentile(lat, 50)), "p99_ms": float(np.percentile(lat, 99))}
 
-    s_cal = score(_features([r["state"] for r in cal]))
+    s_cal = score(featurize([r["state"] for r in cal]))
     grid = [*np.unique(np.quantile(s_cal, np.linspace(0, 1, 50))), np.inf]
     out = {}
     for eps in epsilons:
@@ -168,7 +168,9 @@ def _router(fit, test, names, costs, epsilons, delta, seed):
 
 
 def run(rows: list[dict], names: list[str], costs: list[float], epsilons=EPSILONS,
-        splits: int = 10, fit_frac: float = 0.5, delta: float = 0.05, seed: int = 0) -> dict:
+        splits: int = 10, fit_frac: float = 0.5, delta: float = 0.05, seed: int = 0,
+        method: str = "bonferroni", featurize=_features) -> dict:
+    """featurize(texts) -> (n, d) array for the learned router (default: hashed n-grams)."""
     n, k = len(rows), len(names)
     per_split = []
     for s in range(splits):
@@ -183,13 +185,13 @@ def run(rows: list[dict], names: list[str], costs: list[float], epsilons=EPSILON
         for eps in epsilons:
             for key, sl in (("cascade", slice(0, k)), ("llm_only", slice(1, k))):
                 try:
-                    chosen = optimize(fc[sl], fok[sl], costs[sl], eps, delta)
+                    chosen = optimize(fc[sl], fok[sl], costs[sl], eps, delta, method=method, seed=seed + s)
                 except ValueError:  # unreachable target on this split
                     continue
                 taus = chosen.thresholds if key == "cascade" else (SKIP, *chosen.thresholds)
                 out[key][eps] = {**_point(tc, tok, tms, costs, taus), "thresholds": taus}
         if k >= 2 and all("state" in r for r in rows):
-            out["router"] = _router(fit, test, names, costs, epsilons, delta, seed + s)
+            out["router"] = _router(fit, test, names, costs, epsilons, delta, seed + s, featurize)
         for j, name in enumerate(names):
             only = tuple(SKIP if i != j else 0.0 for i in range(k - 1)) if j < k - 1 else (SKIP,) * (k - 1)
             out["always"][name] = _point(tc, tok, tms, costs, only)

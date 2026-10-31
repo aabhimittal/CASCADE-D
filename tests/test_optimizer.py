@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 
 from cascaded.backends.base import DecisionBackend
-from cascaded.optimizer import SKIP, Cascade, binom_pvalue, optimize, outcomes, risk_coverage, simulate
+from cascaded.optimizer import (SKIP, Cascade, binom_pvalue, optimize, optimize_per_task, outcomes, required_n,
+                                risk_coverage, simulate)
 from cascaded.schema import Answer, DecisionRequest, DecisionResponse
 
 COSTS = [0.01, 1.0, 10.0]  # d1 ~free, small LLM, large LLM
@@ -107,3 +108,43 @@ def test_runtime_cascade_matches_simulation():
     cascade = Cascade(tiers, taus)
     answered = [cascade.decide(r).tier for r, _ in examples]
     assert tuple(answered.count(f"t{k}") / 300 for k in range(3)) == pytest.approx(expected.coverage)
+
+
+def test_pareto_testing_is_cheaper_and_still_controls_error():
+    conf, correct = synthetic(8000, seed=42)
+    idx = np.random.default_rng(0).permutation(8000)
+    v, t = idx[:4000], idx[4000:]
+    bonf = optimize(conf[:, v], correct[:, v], COSTS, 0.05)
+    par = optimize(conf[:, v], correct[:, v], COSTS, 0.05, method="pareto")
+    assert par.cost < bonf.cost
+    assert simulate(conf[:, t], correct[:, t], COSTS, par.thresholds).error <= 0.06  # held-out, with test noise
+    with pytest.raises(ValueError, match="unknown method"):
+        optimize(conf[:, v], correct[:, v], COSTS, 0.05, method="nope")
+
+
+def test_per_task_thresholds_skip_tier0_where_it_is_unreliable():
+    good_conf, good_ok = synthetic(3000, seed=7)
+    bad_conf, bad_ok = synthetic(3000, seed=8)
+    bad_ok[0] = np.random.default_rng(9).uniform(size=3000) < 0.5  # tier 0 confident but a coin flip
+    conf, correct = np.hstack([good_conf, bad_conf]), np.hstack([good_ok, bad_ok])
+    tasks = ["good"] * 3000 + ["bad"] * 3000
+    per = optimize_per_task(conf, correct, COSTS, 0.05, tasks)
+    assert per["good"].coverage[0] > 0.2
+    assert per["bad"].thresholds[0] == SKIP  # tier 0 never called, never paid for, on the unreliable task
+
+
+def test_cascade_routes_by_task_and_distrusts_unknown_tasks():
+    tiers = [TableTier(f"t{k}", np.array([0.99]), np.array([True])) for k in range(3)]
+    q = {"q": {"type": "noul", "instructions": "?"}}
+    cascade = Cascade(tiers, {"easy": (0.5, 0.5), "hard": (SKIP, 0.5)})
+    assert cascade.decide(DecisionRequest(state=0, questions=q, task="easy")).tier == "t0"
+    assert cascade.decide(DecisionRequest(state=0, questions=q, task="hard")).tier == "t1"
+    assert cascade.decide(DecisionRequest(state=0, questions=q, task="new")).tier == "t2"
+
+
+def test_required_n_grows_with_search_size_and_shrinks_with_margin():
+    assert required_n(0.05, 0.03, settings=2704) > required_n(0.05, 0.03) > required_n(0.05, 0.01)
+    n = required_n(0.05, 0.03)
+    assert binom_pvalue(round(0.03 * n), n, 0.05) <= 0.05
+    with pytest.raises(ValueError):
+        required_n(0.05, 0.06)
