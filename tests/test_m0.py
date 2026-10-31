@@ -136,3 +136,22 @@ def test_tier_parity():
         for name, q in REQUEST.questions.items():
             assert list(r.answers[name].probabilities) == q.options
             assert 0 < r.answers[name].confidence <= 1
+
+
+def test_llm_backend_asks_questions_concurrently():
+    import threading
+    import time
+    inflight, peak, lock = [0], [0], threading.Lock()
+
+    def slow(body):
+        with lock:
+            inflight[0] += 1
+            peak[0] = max(peak[0], inflight[0])
+        time.sleep(0.05)
+        with lock:
+            inflight[0] -= 1
+        return fake_openai(body)
+
+    r = LLMChoiceBackend("small", post=slow).decide(REQUEST)
+    assert peak[0] == 3 and set(r.answers) == set(REQUEST.questions)
+    assert r.usage == {"input_tokens": 150, "output_tokens": 3}

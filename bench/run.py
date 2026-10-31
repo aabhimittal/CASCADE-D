@@ -50,6 +50,26 @@ def d1_backend():
     return D1Backend(model=model.to("cuda" if torch.cuda.is_available() else "cpu"))
 
 
+def embedder(model_id="sentence-transformers/all-MiniLM-L6-v2"):
+    """Sentence embeddings for the learned router (mean-pooled, L2-normalised), cached per text."""
+    import numpy as np
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+    tok, model, cache = AutoTokenizer.from_pretrained(model_id), AutoModel.from_pretrained(model_id).eval(), {}
+
+    def featurize(texts):
+        todo = [t for t in dict.fromkeys(map(str, texts)) if t not in cache]
+        for i in range(0, len(todo), 64):
+            batch = tok(todo[i:i + 64], padding=True, truncation=True, max_length=256, return_tensors="pt")
+            with torch.no_grad():
+                h = model(**batch).last_hidden_state
+            m = batch["attention_mask"].unsqueeze(-1)
+            v = torch.nn.functional.normalize((h * m).sum(1) / m.sum(1), dim=-1)
+            cache.update(zip(todo[i:i + 64], v.numpy()))
+        return np.stack([cache[str(t)] for t in texts])
+    return featurize
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dataset", choices=sorted(DATASETS))
@@ -60,6 +80,10 @@ def main():
     ap.add_argument("--base-url", default="https://api.openai.com/v1")
     ap.add_argument("--costs", help="cost per request per tier, d1 first")
     ap.add_argument("--out", help="report path (default: <dataset>_report.html)")
+    ap.add_argument("--method", choices=["bonferroni", "pareto"], default="bonferroni",
+                    help="Learn-then-Test correction: bonferroni (safest) or pareto (cheaper)")
+    ap.add_argument("--router-embeddings", action="store_true",
+                    help="learned-router baseline on MiniLM sentence embeddings instead of hashed n-grams")
     a = ap.parse_args()
     cache = a.cache or f"{a.dataset}.jsonl"
 
@@ -72,7 +96,9 @@ def main():
         return
     out = a.out or f"{a.dataset}_report.html"
     with open(out, "w") as f:
-        f.write(render(run(rows, [t.name for t in tiers], [float(c) for c in a.costs.split(",")]),
+        extra = {"featurize": embedder()} if a.router_embeddings else {}
+        f.write(render(run(rows, [t.name for t in tiers], [float(c) for c in a.costs.split(",")],
+                           method=a.method, **extra),
                        f"CASCADE-D on {a.dataset}"))
     print(f"wrote {out}")
 

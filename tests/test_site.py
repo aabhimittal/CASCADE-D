@@ -25,3 +25,10 @@ def test_clean_text():
     clean = runpy.run_path(str(BUILD))["_clean"]
     assert clean("CBS #39;s quot;hit quot; a\\\\b") == "CBS's \"hit \" a b"
     assert clean("word " * 100).endswith("…")
+
+
+def test_site_can_omit_dataset_text(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["build.py", "--out", str(tmp_path), "--no-text"])
+    runpy.run_path(str(BUILD), run_name="__main__")
+    data = json.loads((tmp_path / "data.json").read_text())
+    assert all(it[3] == "" for d in data.values() for it in d["items"])

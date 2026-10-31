@@ -92,7 +92,9 @@ Current pricing and logprob availability for each provider tier; d1-3B question 
   | Emotion (6-way) | 1000 | 68.8% | 0.060 | 0.167 | not certifiable | not certifiable |
 
   Emotion is the §10 risk made concrete: per-class accuracy falls to 32/78 on love and 12/37 on surprise, so no threshold can be certified and tier 0 should be skipped for that task family.
-- Still open: per-provider pricing (M2 needs it), TypeSafe adapter license.
+- **Licences and terms** (checked 2026-10-31): TypeSafe's `system-one-adapter-python` is MIT (repository LICENSE file). AG News: "provided by the academic community for research … and any other non-commercial activity" (source page); the Hugging Face card says unknown. SST-2: card says unknown. dair-ai/emotion: "educational and research purposes only". The demo site shows example text under those terms; `site/build.py --no-text` publishes numbers only.
+- **Latency:** every d1-3B timing here is bf16 on a 4-core CPU (~400 ms p50). GPU figures (8 ms RTX 4090 with CUDA graphs, 16 ms without) are Liquid AI's, from the model card, not measured by us.
+- Still open: per-provider pricing and logprob availability for the LLM tiers (needs API access).
 
 ## 12. Claude Code kickoff
 

@@ -106,3 +106,18 @@ def test_learned_router_baseline_uses_request_text():
 
 def test_router_skipped_without_request_text(result):
     assert result["summary"]["router"] == {}
+
+
+def test_router_accepts_custom_features():
+    rows = synthetic_rows(1200, seed=11)
+    for r in rows:
+        ok = next(iter(r["tiers"]["small"]["answers"]["q"].items()))[0] == r["truth"]["q"]
+        r["state"] = "a" if ok else "b"
+    calls = []
+
+    def featurize(texts):  # stand-in for sentence embeddings
+        calls.append(len(texts))
+        return np.array([[1.0, 0.0] if t == "a" else [0.0, 1.0] for t in texts], dtype=np.float32)
+
+    res = run(rows, NAMES, COSTS, epsilons=(0.1,), splits=1, featurize=featurize, method="pareto")
+    assert calls and res["summary"]["router"][0.1]["coverage"][1] > 0.5

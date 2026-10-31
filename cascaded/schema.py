@@ -49,6 +49,7 @@ class Question(BaseModel):
 class DecisionRequest(BaseModel):
     state: Any  # string, any JSON value, or None
     questions: dict[str, Question] = Field(min_length=1)
+    task: str | None = Field(None, max_length=64)  # task family, for per-task thresholds (e.g. "ticket-routing")
 
 
 class Answer(BaseModel):

@@ -13,6 +13,7 @@ import math
 import os
 import string
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 from cascaded.backends.base import DecisionBackend
 from cascaded.schema import Answer, DecisionRequest, DecisionResponse, Question
@@ -40,9 +41,8 @@ class LLMChoiceBackend(DecisionBackend):
 
     def _decide(self, request: DecisionRequest) -> DecisionResponse:
         state = request.state if isinstance(request.state, str) else json.dumps(request.state)
-        answers, usage = {}, {"input_tokens": 0, "output_tokens": 0}
-        # shortcut: one API call per question; batch questions into one call if latency matters (M3)
-        for key, q in request.questions.items():
+
+        def ask(q: Question):
             letters = _letters(q)
             resp = self._post({
                 "model": self.model,
@@ -52,9 +52,15 @@ class LLMChoiceBackend(DecisionBackend):
                 "logprobs": True,
                 "top_logprobs": TOP_LOGPROBS,
             })
-            answers[key] = Answer(probabilities=_letter_probs(resp, letters))
-            usage["input_tokens"] += resp.get("usage", {}).get("prompt_tokens", 0)
-            usage["output_tokens"] += resp.get("usage", {}).get("completion_tokens", 0)
+            return Answer(probabilities=_letter_probs(resp, letters)), resp.get("usage", {})
+
+        # one call per question keeps each answer a single clean token; run them concurrently so
+        # latency is one round trip rather than one per question
+        with ThreadPoolExecutor(max_workers=min(8, len(request.questions))) as pool:
+            results = dict(zip(request.questions, pool.map(ask, request.questions.values())))
+        answers = {k: a for k, (a, _) in results.items()}
+        usage = {"input_tokens": sum(u.get("prompt_tokens", 0) for _, u in results.values()),
+                 "output_tokens": sum(u.get("completion_tokens", 0) for _, u in results.values())}
         return DecisionResponse(tier=self.name, answers=answers, usage=usage)
 
 

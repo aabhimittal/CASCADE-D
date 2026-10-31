@@ -1,8 +1,12 @@
 """M3: request ledger and a self-contained static HTML cost dashboard (no JS, no CDN)."""
 
 import html
+import json
+import math
+import os
+import threading
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import numpy as np
 
@@ -12,16 +16,63 @@ class Record:
     tier: int          # index of the tier that answered
     cost: float        # summed cost of every tier the request passed through
     latency_ms: float
+    task: str | None = None
 
 
 class Ledger:
-    # shortcut: in-memory ring buffer, lost on restart; persist to a file/DB once traffic matters
-    def __init__(self, tier_names: list[str], costs: list[float], maxlen: int = 100_000):
-        self.tier_names, self.costs = tier_names, costs
-        self.records: deque[Record] = deque(maxlen=maxlen)
+    """Recent requests, optionally persisted as JSONL so stats survive restarts."""
 
-    def add(self, tier: int, cost: float, latency_ms: float) -> None:
-        self.records.append(Record(tier, cost, latency_ms))
+    def __init__(self, tier_names: list[str], costs: list[float], maxlen: int = 100_000,
+                 path: str | None = None, expected: dict | None = None):
+        self.tier_names, self.costs, self.path = tier_names, costs, path
+        self.expected = expected or {}  # {task: validation coverage per tier}, for drift checks
+        self.records: deque[Record] = deque(maxlen=maxlen)
+        self._lines = 0
+        self._lock = threading.Lock()  # proxy endpoints run on a thread pool
+        if path:
+            try:
+                with open(path) as f:
+                    lines = [line for line in f if line.strip()]
+            except FileNotFoundError:
+                lines = []
+            for line in lines:
+                try:
+                    self.records.append(Record(**json.loads(line)))
+                except (ValueError, TypeError):  # a torn last line from a crash: skip it, keep the rest
+                    pass
+            self._lines = len(lines)
+
+    def add(self, tier: int, cost: float, latency_ms: float, task: str | None = None) -> None:
+        r = Record(tier, cost, latency_ms, task)
+        with self._lock:
+            self.records.append(r)
+            if not self.path:
+                return
+            with open(self.path, "a") as f:  # shortcut: one open per request; batch writes at high QPS
+                f.write(json.dumps(asdict(r)) + "\n")
+            self._lines += 1
+            if self._lines >= 2 * self.records.maxlen:  # compact: the file never outgrows twice the window
+                tmp = self.path + ".tmp"
+                with open(tmp, "w") as f:
+                    f.writelines(json.dumps(asdict(x)) + "\n" for x in list(self.records))
+                os.replace(tmp, self.path)  # atomic: a crash leaves the old file or the new one, never half
+                self._lines = len(self.records)
+
+    def drift(self, min_requests: int = 50, z_alarm: float = 3.0) -> list[dict]:
+        """Live vs validation coverage per task and tier. Label-free: a big shift means traffic no longer
+        looks like the validation set, so the error guarantee no longer applies. Normal approximation."""
+        out = []
+        for task, expected in self.expected.items():
+            tiers = [r.tier for r in self.records if r.task == task]
+            if len(tiers) < min_requests:
+                continue
+            for k, exp in enumerate(expected):
+                obs = sum(t == k for t in tiers) / len(tiers)
+                sd = math.sqrt(max(exp * (1 - exp), 1e-9) / len(tiers))
+                z = (obs - exp) / sd
+                out.append({"task": task, "tier": self.tier_names[k], "expected": exp, "observed": obs,
+                            "n": len(tiers), "z": z, "alarm": abs(z) >= z_alarm})
+        return out
 
     def summary(self) -> dict:
         n = len(self.records)
@@ -32,6 +83,7 @@ class Ledger:
         lat = np.array([r.latency_ms for r in self.records])
         baseline = self.costs[-1]  # always-large: every request goes straight to the last tier
         return {
+            "drift": self.drift(),
             "requests": n,
             "mean_cost": float(cost.mean()),
             "baseline_cost": baseline,
@@ -58,6 +110,10 @@ th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}td.n{f
 """
 
 
+def _temps(t) -> str:
+    return ", ".join(f"{k} {v:.2f}" for k, v in t.items()) if isinstance(t, dict) else f"{t:.2f}"
+
+
 def _ms(v: float | None) -> str:
     return "—" if v is None else f"{v:.0f} ms"
 
@@ -79,9 +135,17 @@ def render(ledger: Ledger, calibration: list[dict] | None = None) -> str:
         body = ("<div class=kpis>" + "".join(f"<div class=kpi><span>{k}</span><b>{v}</b></div>" for k, v in kpis)
                 + "</div><table><caption>Who answered</caption><tr><th>Tier</th><th>Requests</th><th>Share</th>"
                 f"<th></th><th>p50</th></tr>{rows}</table>")
+    drift = ledger.drift()
+    if drift:
+        rows = "".join(
+            f"<tr><td>{esc(str(d['task'] or 'all'))}</td><td>{esc(d['tier'])}</td><td class=n>{d['expected']:.1%}</td>"
+            f"<td class=n>{d['observed']:.1%}</td><td class=n>{d['n']:,}</td>"
+            f"<td>{'⚠ recalibrate: traffic has shifted' if d['alarm'] else 'ok'}</td></tr>" for d in drift)
+        body += ("<table><caption>Drift: who answers now vs on validation</caption><tr><th>Task</th><th>Tier</th>"
+                 f"<th>Validation</th><th>Live</th><th>Requests</th><th>Status</th></tr>{rows}</table>")
     if calibration:
         cal = "".join(
-            f"<tr><td>{esc(r['tier'])}</td><td class=n>{r['temperature']:.2f}</td><td class=n>{r['ece_before']:.3f}</td>"
+            f"<tr><td>{esc(r['tier'])}</td><td class=n>{_temps(r['temperature'])}</td><td class=n>{r['ece_before']:.3f}</td>"
             f"<td class=n>{r['ece_after']:.3f}</td><td>{r['reliability'].svg(120)}</td></tr>" for r in calibration)
         body += ("<table><caption>Calibration (held-out)</caption><tr><th>Tier</th><th>T</th><th>ECE before</th>"
                  f"<th>ECE after</th><th>Reliability</th></tr>{cal}</table>")
