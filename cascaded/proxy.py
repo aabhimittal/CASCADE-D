@@ -15,10 +15,8 @@ Run: uvicorn --factory "yourmodule:build_app"  where build_app returns make_app(
 import json
 import os
 import secrets
-import threading
 import time
 import uuid
-from collections import defaultdict, deque
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -30,39 +28,26 @@ from cascaded.schema import DecisionRequest, DecisionResponse
 
 
 def make_app(cascade: Cascade, costs: list[float], calibration: list[dict] | None = None,
-             ledger_path: str | None = None, expected_coverage: dict | None = None,
+             state_path: str | None = None, expected_coverage: dict | None = None,
              api_key: str | None = None, rate_limit_per_minute: int | None = None) -> FastAPI:
-    """expected_coverage: {task: Result.coverage} from validation, enables the drift table.
+    """state_path: SQLite file for the request log and rate limit; give every worker the same path.
+    expected_coverage: {task: Result.coverage} from validation, enables the drift table.
     api_key (or env CASCADED_API_KEY): if set, every endpoint needs "Authorization: Bearer <key>"."""
     if len(costs) != len(cascade.tiers):
         raise ValueError("one cost per tier")
     names = [t.name for t in cascade.tiers]
     if len(set(names)) != len(names):
         raise ValueError(f"tier names must be unique (they identify who answered): {names}")
-    ledger = Ledger(names, costs, path=ledger_path, expected=expected_coverage)
+    ledger = Ledger(names, costs, path=state_path, expected=expected_coverage)
     api_key = api_key or os.environ.get("CASCADED_API_KEY")
-    recent: dict[str, deque] = defaultdict(deque)
-    recent_lock = threading.Lock()  # sync endpoints run on FastAPI's thread pool
 
     def guard(req: Request) -> None:
         if api_key and not secrets.compare_digest(req.headers.get("authorization", ""), f"Bearer {api_key}"):
             raise HTTPException(401, "missing or wrong API key")
-        if rate_limit_per_minute:
-            # shortcut: per-process memory; use a shared store (e.g. Redis) when running several workers
-            # key on the client address, never on a header the client chooses (a fresh header per request
-            # would get a fresh bucket); drop idle buckets so memory stays bounded by active clients
-            who, now = req.client.host if req.client else "?", time.monotonic()
-            with recent_lock:
-                for k in [k for k, v in recent.items() if not v or now - v[-1] > 60]:
-                    recent.pop(k, None)
-                q = recent[who]
-                while q and now - q[0] > 60:
-                    q.popleft()
-                limited = len(q) >= rate_limit_per_minute
-                if not limited:
-                    q.append(now)
-            if limited:
-                raise HTTPException(429, "rate limit exceeded, retry in a minute")
+        # key on the client address, never on a header the client chooses (a fresh header per request
+        # would get a fresh bucket); the window lives in the shared store, so every worker enforces one limit
+        if rate_limit_per_minute and not ledger.store.allow(req.client.host if req.client else "?", rate_limit_per_minute):
+            raise HTTPException(429, "rate limit exceeded, retry in a minute")
 
     app = FastAPI(title="CASCADE-D", dependencies=[Depends(guard)])
     app.state.ledger = ledger

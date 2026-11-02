@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 
 from cascaded.backends.base import DecisionBackend
-from cascaded.optimizer import (SKIP, Cascade, binom_pvalue, optimize, optimize_per_task, outcomes, required_n,
+from cascaded.optimizer import (SKIP, Cascade, binom_pvalue, label_plan, optimize, optimize_per_task, outcomes,
+                                required_n,
                                 risk_coverage, simulate)
 from cascaded.schema import Answer, DecisionRequest, DecisionResponse
 
@@ -148,3 +149,27 @@ def test_required_n_grows_with_search_size_and_shrinks_with_margin():
     assert binom_pvalue(round(0.03 * n), n, 0.05) <= 0.05
     with pytest.raises(ValueError):
         required_n(0.05, 0.06)
+
+
+def test_under_labelled_task_falls_back_instead_of_failing_all():
+    big_c, big_ok = synthetic(4000, seed=12)
+    tiny_c, tiny_ok = synthetic(30, seed=13)  # far too few labels to certify anything at 5%
+    conf, correct = np.hstack([big_c, tiny_c]), np.hstack([big_ok, tiny_ok])
+    per = optimize_per_task(conf, correct, COSTS, 0.05, ["big"] * 4000 + ["tiny"] * 30)
+    assert per["big"].certified and per["big"].coverage[0] > 0
+    assert not per["tiny"].certified and per["tiny"].thresholds == (SKIP, SKIP)
+
+
+def test_label_plan_trades_labels_for_running_cost():
+    big_c, big_ok = synthetic(4000, seed=12)
+    small_c, small_ok = synthetic(300, seed=13)
+    conf, correct = np.hstack([big_c, small_c]), np.hstack([big_ok, small_ok])
+    tasks = ["big"] * 4000 + ["small"] * 300
+    plan = label_plan(conf, correct, COSTS, 0.05, tasks)
+    assert plan["big"]["certified"] and not plan["small"]["certified"]
+    opts = plan["big"]["options"]
+    assert len(opts) >= 3
+    assert all(a["need"] <= b["need"] and a["cost"] >= b["cost"] for a, b in zip(opts, opts[1:]))  # labels buy cheaper runs
+    assert plan["small"]["options"][0]["shortfall"] > 0
+    pareto = label_plan(conf, correct, COSTS, 0.05, tasks, method="pareto")
+    assert pareto["big"]["options"][-1]["need"] < opts[-1]["need"]  # no multiplicity penalty
