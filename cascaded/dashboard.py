@@ -1,14 +1,12 @@
 """M3: request ledger and a self-contained static HTML cost dashboard (no JS, no CDN)."""
 
 import html
-import json
 import math
-import os
-import threading
-from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 import numpy as np
+
+from cascaded.store import Store
 
 
 @dataclass
@@ -20,50 +18,28 @@ class Record:
 
 
 class Ledger:
-    """Recent requests, optionally persisted as JSONL so stats survive restarts."""
+    """Recent requests. With `path`, they live in a SQLite file that survives restarts and is shared by
+    every worker process pointed at it; without, they stay in this process's memory."""
 
     def __init__(self, tier_names: list[str], costs: list[float], maxlen: int = 100_000,
                  path: str | None = None, expected: dict | None = None):
-        self.tier_names, self.costs, self.path = tier_names, costs, path
+        self.tier_names, self.costs = tier_names, costs
         self.expected = expected or {}  # {task: validation coverage per tier}, for drift checks
-        self.records: deque[Record] = deque(maxlen=maxlen)
-        self._lines = 0
-        self._lock = threading.Lock()  # proxy endpoints run on a thread pool
-        if path:
-            try:
-                with open(path) as f:
-                    lines = [line for line in f if line.strip()]
-            except FileNotFoundError:
-                lines = []
-            for line in lines:
-                try:
-                    self.records.append(Record(**json.loads(line)))
-                except (ValueError, TypeError):  # a torn last line from a crash: skip it, keep the rest
-                    pass
-            self._lines = len(lines)
+        self.store = Store(path or ":memory:", maxlen)
+
+    @property
+    def records(self) -> list[Record]:
+        return [Record(*row) for row in self.store.requests()]
 
     def add(self, tier: int, cost: float, latency_ms: float, task: str | None = None) -> None:
-        r = Record(tier, cost, latency_ms, task)
-        with self._lock:
-            self.records.append(r)
-            if not self.path:
-                return
-            with open(self.path, "a") as f:  # shortcut: one open per request; batch writes at high QPS
-                f.write(json.dumps(asdict(r)) + "\n")
-            self._lines += 1
-            if self._lines >= 2 * self.records.maxlen:  # compact: the file never outgrows twice the window
-                tmp = self.path + ".tmp"
-                with open(tmp, "w") as f:
-                    f.writelines(json.dumps(asdict(x)) + "\n" for x in list(self.records))
-                os.replace(tmp, self.path)  # atomic: a crash leaves the old file or the new one, never half
-                self._lines = len(self.records)
+        self.store.add(tier, cost, latency_ms, task)
 
     def drift(self, min_requests: int = 50, z_alarm: float = 3.0) -> list[dict]:
         """Live vs validation coverage per task and tier. Label-free: a big shift means traffic no longer
         looks like the validation set, so the error guarantee no longer applies. Normal approximation."""
-        out = []
+        out, records = [], self.records
         for task, expected in self.expected.items():
-            tiers = [r.tier for r in self.records if r.task == task]
+            tiers = [r.tier for r in records if r.task == task]
             if len(tiers) < min_requests:
                 continue
             for k, exp in enumerate(expected):

@@ -139,11 +139,11 @@ def test_drift_alarm_when_live_coverage_departs_from_validation():
 
 
 def test_ledger_persists_across_restarts(tmp_path):
-    path = str(tmp_path / "ledger.jsonl")
+    path = str(tmp_path / "state.db")
     tiers = [Fake("d1", ["easy"]), Fake("small", []), Fake("large", [])]
-    TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, ledger_path=path)).post(
+    TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, state_path=path)).post(
         "/v1/decide", json={**DECIDE, "state": "easy"})
-    again = TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, ledger_path=path))
+    again = TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, state_path=path))
     assert again.get("/stats").json()["requests"] == 1
 
 
@@ -165,30 +165,69 @@ def test_rate_limit_cannot_be_bypassed_with_fresh_headers():
     assert codes == [200, 200, 429]
 
 
-def test_oversized_task_rejected_and_ledger_file_bounded(tmp_path):
+def test_oversized_task_rejected_and_ledger_window_bounded(tmp_path):
     tiers = [Fake("d1", ["easy"]), Fake("small", []), Fake("large", [])]
     assert TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS)).post(
         "/v1/decide", json={**DECIDE, "state": "easy", "task": "x" * 65}).status_code == 422
-    path = tmp_path / "l.jsonl"
-    ledger = Ledger(["a"], [1.0], maxlen=10, path=str(path))
+    path = str(tmp_path / "state.db")
+    ledger = Ledger(["a"], [1.0], maxlen=10, path=path)
     for _ in range(55):
         ledger.add(0, 1.0, 1.0)
-    assert len(path.read_text().splitlines()) < 20 and len(Ledger(["a"], [1.0], maxlen=10, path=str(path)).records) == 10
+    (rows,) = ledger.store._db.execute("SELECT COUNT(*) FROM requests").fetchone()
+    assert rows == 10 and len(Ledger(["a"], [1.0], maxlen=10, path=path).records) == 10
 
 
 def test_concurrent_requests_are_safe(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
-    path = tmp_path / "l.jsonl"
-    ledger = Ledger(["a"], [1.0], maxlen=20, path=str(path))
+    ledger = Ledger(["a"], [1.0], maxlen=1000, path=str(tmp_path / "state.db"))
     with ThreadPoolExecutor(16) as pool:
         list(pool.map(lambda _: ledger.add(0, 1.0, 1.0), range(400)))
-    lines = path.read_text().splitlines()
-    assert all(json.loads(line)["tier"] == 0 for line in lines) and len(lines) < 40
-    path.write_text(path.read_text() + '{"tier": 0, "cost": 1')  # torn write from a crash
-    assert len(Ledger(["a"], [1.0], maxlen=20, path=str(path)).records) == 20
+    assert len(ledger.records) == 400
 
     tiers = [Fake("d1", ["easy"]), Fake("small", []), Fake("large", [])]
     c = TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, rate_limit_per_minute=1000))
     with ThreadPoolExecutor(16) as pool:
         codes = list(pool.map(lambda _: c.post("/v1/decide", json={**DECIDE, "state": "easy"}).status_code, range(200)))
     assert codes.count(200) == 200
+
+
+def _worker_writes(path, n):
+    ledger = Ledger(["a", "b"], [1.0, 2.0], path=path)
+    for _ in range(n):
+        ledger.add(1, 2.0, 1.0, "routing")
+
+
+def test_worker_processes_share_one_ledger(tmp_path):
+    """Several uvicorn workers = several OS processes: all of them must land in one ledger."""
+    import multiprocessing
+    path = str(tmp_path / "state.db")
+    Ledger(["a", "b"], [1.0, 2.0], path=path)  # create the schema before the workers race
+    ctx = multiprocessing.get_context("spawn")
+    procs = [ctx.Process(target=_worker_writes, args=(path, 50)) for _ in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(60)
+        assert p.exitcode == 0
+    reader = Ledger(["a", "b"], [1.0, 2.0], path=path, expected={"routing": [0.5, 0.5]})
+    assert len(reader.records) == 200
+    assert reader.drift()[0]["n"] == 200  # drift sees every worker's traffic
+
+
+def test_rate_limit_is_shared_between_workers(tmp_path):
+    path = str(tmp_path / "state.db")
+    tiers = [Fake("d1", ["easy"]), Fake("small", []), Fake("large", [])]
+    worker_a = TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, state_path=path, rate_limit_per_minute=3))
+    worker_b = TestClient(make_app(Cascade(tiers, (0.9, 0.9)), COSTS, state_path=path, rate_limit_per_minute=3))
+    req = {**DECIDE, "state": "easy"}
+    codes = [w.post("/v1/decide", json=req).status_code for w in (worker_a, worker_b, worker_a, worker_b)]
+    assert codes == [200, 200, 200, 429]  # one limit across both, not 3 each
+
+
+def test_rate_limit_window_slides():
+    from cascaded.store import Store
+    s = Store()
+    assert [s.allow("ip", 2, now=t) for t in (0, 1, 2)] == [True, True, False]
+    assert s.allow("other", 2, now=2)          # per client
+    assert s.allow("ip", 2, now=60.5)          # the hit at t=0 has left the window
+    assert not s.allow("ip", 2, now=60.6)      # t=1 and t=60.5 still in it
