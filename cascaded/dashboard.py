@@ -2,6 +2,7 @@
 
 import html
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -26,6 +27,7 @@ class Ledger:
         self.tier_names, self.costs = tier_names, costs
         self.expected = expected or {}  # {task: validation coverage per tier}, for drift checks
         self.store = Store(path or ":memory:", maxlen)
+        self._cache: tuple[float, dict] | None = None
 
     @property
     def records(self) -> list[Record]:
@@ -33,11 +35,12 @@ class Ledger:
 
     def add(self, tier: int, cost: float, latency_ms: float, task: str | None = None) -> None:
         self.store.add(tier, cost, latency_ms, task)
+        self._cache = None  # this process's own writes show at once; other workers' within max_age
 
-    def drift(self, min_requests: int = 50, z_alarm: float = 3.0) -> list[dict]:
+    def drift(self, min_requests: int = 50, z_alarm: float = 3.0, records: list[Record] | None = None) -> list[dict]:
         """Live vs validation coverage per task and tier. Label-free: a big shift means traffic no longer
         looks like the validation set, so the error guarantee no longer applies. Normal approximation."""
-        out, records = [], self.records
+        out, records = [], self.records if records is None else records
         for task, expected in self.expected.items():
             tiers = [r.tier for r in records if r.task == task]
             if len(tiers) < min_requests:
@@ -50,16 +53,27 @@ class Ledger:
                             "n": len(tiers), "z": z, "alarm": abs(z) >= z_alarm})
         return out
 
-    def summary(self) -> dict:
-        n = len(self.records)
+    def summary(self, max_age: float = 2.0) -> dict:
+        """Aggregates over the window. Cached for `max_age` seconds: the dashboard and /stats can be hit
+        often, and each fresh summary reads up to `maxlen` rows."""
+        now = time.monotonic()
+        if self._cache and now - self._cache[0] < max_age:
+            return self._cache[1]
+        records = self.records  # one read, shared by everything below
+        out = self._summarise(records)
+        self._cache = (now, out)
+        return out
+
+    def _summarise(self, records: list[Record]) -> dict:
+        n = len(records)
         if n == 0:
-            return {"requests": 0}
-        tier = np.array([r.tier for r in self.records])
-        cost = np.array([r.cost for r in self.records])
-        lat = np.array([r.latency_ms for r in self.records])
+            return {"requests": 0, "drift": []}
+        tier = np.array([r.tier for r in records])
+        cost = np.array([r.cost for r in records])
+        lat = np.array([r.latency_ms for r in records])
         baseline = self.costs[-1]  # always-large: every request goes straight to the last tier
         return {
-            "drift": self.drift(),
+            "drift": self.drift(records=records),
             "requests": n,
             "mean_cost": float(cost.mean()),
             "baseline_cost": baseline,
@@ -111,7 +125,7 @@ def render(ledger: Ledger, calibration: list[dict] | None = None) -> str:
         body = ("<div class=kpis>" + "".join(f"<div class=kpi><span>{k}</span><b>{v}</b></div>" for k, v in kpis)
                 + "</div><table><caption>Who answered</caption><tr><th>Tier</th><th>Requests</th><th>Share</th>"
                 f"<th></th><th>p50</th></tr>{rows}</table>")
-    drift = ledger.drift()
+    drift = s.get("drift", [])
     if drift:
         rows = "".join(
             f"<tr><td>{esc(str(d['task'] or 'all'))}</td><td>{esc(d['tier'])}</td><td class=n>{d['expected']:.1%}</td>"

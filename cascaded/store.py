@@ -17,8 +17,12 @@ class Store:
         self.maxlen = maxlen
         self._lock = threading.Lock()  # one connection per Store, shared by FastAPI's worker threads
         self._db = sqlite3.connect(path, check_same_thread=False, timeout=30, isolation_level=None)
+        self._read, self._read_lock = self._db, self._lock
         if path != ":memory:":
             self._db.execute("PRAGMA journal_mode=WAL")  # readers don't block the writer
+            # separate read connection: a big dashboard read never holds the lock request logging needs
+            self._read = sqlite3.connect(path, check_same_thread=False, timeout=30, isolation_level=None)
+            self._read_lock = threading.Lock()
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tier INTEGER NOT NULL, cost REAL NOT NULL, latency_ms REAL NOT NULL, task TEXT);
@@ -34,8 +38,8 @@ class Store:
 
     def requests(self) -> list[tuple]:
         """(tier, cost, latency_ms, task) for the most recent `maxlen` requests from every process, oldest first."""
-        with self._lock:
-            rows = self._db.execute("SELECT tier, cost, latency_ms, task FROM requests ORDER BY id DESC LIMIT ?",
+        with self._read_lock:
+            rows = self._read.execute("SELECT tier, cost, latency_ms, task FROM requests ORDER BY id DESC LIMIT ?",
                                     (self.maxlen,)).fetchall()
         return rows[::-1]
 

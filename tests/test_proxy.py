@@ -231,3 +231,18 @@ def test_rate_limit_window_slides():
     assert s.allow("other", 2, now=2)          # per client
     assert s.allow("ip", 2, now=60.5)          # the hit at t=0 has left the window
     assert not s.allow("ip", 2, now=60.6)      # t=1 and t=60.5 still in it
+
+
+def test_dashboard_reads_the_log_once_and_caches(tmp_path):
+    ledger = Ledger(["a", "b"], [1.0, 2.0], path=str(tmp_path / "s.db"), expected={None: [0.5, 0.5]})
+    for i in range(60):
+        ledger.add(i % 2, 1.0, 1.0)
+    reads = []
+    real = ledger.store.requests
+    ledger.store.requests = lambda: reads.append(1) or real()
+    render(ledger)                      # summary + drift + page
+    assert len(reads) == 1
+    render(ledger)                      # within max_age: served from cache
+    assert len(reads) == 1
+    ledger.add(0, 1.0, 1.0)             # own write invalidates
+    assert ledger.summary()["requests"] == 61 and len(reads) == 2
